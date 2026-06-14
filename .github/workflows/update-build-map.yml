@@ -1,0 +1,63 @@
+name: Update build map
+
+# Keeps data/aoe4-build-map.json current every few hours, fully anonymously:
+#   1. an ANONYMOUS Steam session (no account/secrets/ownership) records a newly
+#      released build's date + depot manifest id (anonymous metadata; no files);
+#   2. aoe4world's public API gives the live build's version (its per-game `patch`
+#      is the exe build number == the replay's embedded version), written onto the
+#      latest entry so replays resolve by version (locale-independent), not date.
+# Both steps are read-only public metadata. Local panels fetch this file on startup.
+
+on:
+  schedule:
+    - cron: "37 */6 * * *" # every 6 hours, at :37 to dodge top-of-hour scheduling delays
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-build-map
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install steamcmd
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lib32gcc-s1 ca-certificates curl
+
+      - name: Fetch Steam app_info (anonymous — no credentials)
+        run: |
+          mkdir -p "$RUNNER_TEMP/steamcmd" && cd "$RUNNER_TEMP/steamcmd"
+          curl -sSL https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz | tar zxf -
+          ./steamcmd.sh +login anonymous +app_info_update 1 +app_info_print 1466860 +quit \
+            > "$RUNNER_TEMP/appinfo.txt" 2>&1 || true
+          echo "Captured $(wc -l < "$RUNNER_TEMP/appinfo.txt") lines of app_info."
+
+      - name: Update build map
+        run: python3 scripts/update_build_map.py "$RUNNER_TEMP/appinfo.txt" data/aoe4-build-map.json
+
+      - name: Sync current build version from aoe4world (anonymous public API)
+        run: python3 scripts/fetch_current_patch.py data/aoe4-build-map.json
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- data/aoe4-build-map.json; then
+            echo "Build map already current; nothing to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/aoe4-build-map.json
+            git commit -m "data: update AoE4 build map (new build and/or current version) [automated]"
+            git push
+          fi

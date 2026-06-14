@@ -1,0 +1,35 @@
+# Copy this file to `config.local.toml` and adjust to your machine.
+# `config.local.toml` is gitignored so your Steam username never gets committed.
+
+[paths]
+# Live Age of Empires IV install, used READ-ONLY as the "seed" for launch builds.
+# Leave empty to auto-detect via Steam — handles Steam or the game library being
+# on another drive / in a separate Steam library folder. Set paths only to override.
+steam_install = ""
+steam_exe     = ""
+
+# restic repository that stores every build's delta, deduplicated.
+# Relative paths are resolved against the project root. Kept inside the project
+# by default and gitignored. Created automatically on first run if missing.
+repo = "repo"
+
+# External tools. Auto-downloaded from their official sources into ./tools
+# when missing.
+depotdownloader = "tools/DepotDownloader.exe"
+restic          = "tools/restic.exe"
+runasdate       = "tools/RunAsDate.exe"
+
+# AoE4 user data (replay playback folder + user mods live under here).
+# Leave empty to auto-detect your real Documents folder — this handles Documents
+# redirected to OneDrive (and localized names like "Belgeler"). Set an explicit
+# path only to override.
+documents = ""
+
+[steam]
+# Your Steam account name for DepotDownloader. Leave empty to authenticate
+# with a QR code instead (-qr).
+username = ""
+
+[app]
+app_id        = "1466860"
+default_depot = "1466861"

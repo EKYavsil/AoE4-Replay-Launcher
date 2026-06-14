@@ -1,0 +1,936 @@
+[
+    {
+        "name": "2021-10-13-live",
+        "validFrom": "2021-10-13T17:21:58",
+        "validTo": "2021-10-22T16:13:43",
+        "buildId": "2021-10-13-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5693770809658345318"
+            }
+        ]
+    },
+    {
+        "name": "2021-10-22-live",
+        "validFrom": "2021-10-22T16:13:43",
+        "validTo": "2021-11-15T17:29:20",
+        "buildId": "2021-10-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "922940253933912252"
+            }
+        ]
+    },
+    {
+        "name": "2021-11-15-live",
+        "validFrom": "2021-11-15T17:29:20",
+        "validTo": "2021-11-29T21:04:22",
+        "buildId": "2021-11-15-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3853926185585418750"
+            }
+        ]
+    },
+    {
+        "name": "2021-11-29-live",
+        "validFrom": "2021-11-29T21:04:22",
+        "validTo": "2021-12-09T18:43:13",
+        "buildId": "2021-11-29-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "729734401996381521"
+            }
+        ]
+    },
+    {
+        "name": "2021-12-09-live",
+        "validFrom": "2021-12-09T18:43:13",
+        "validTo": "2022-01-19T18:33:34",
+        "buildId": "2021-12-09-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "436534957798401711"
+            }
+        ]
+    },
+    {
+        "name": "2022-01-19-live",
+        "validFrom": "2022-01-19T18:33:34",
+        "validTo": "2022-02-08T21:38:27",
+        "buildId": "2022-01-19-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "1718767703409828841"
+            }
+        ]
+    },
+    {
+        "name": "2022-02-08-live",
+        "validFrom": "2022-02-08T21:38:27",
+        "validTo": "2022-03-02T21:41:14",
+        "buildId": "2022-02-08-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "962136340524556243"
+            }
+        ]
+    },
+    {
+        "name": "2022-03-02-live",
+        "validFrom": "2022-03-02T21:41:14",
+        "validTo": "2022-03-10T20:58:10",
+        "buildId": "2022-03-02-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2200396168185195798"
+            }
+        ]
+    },
+    {
+        "name": "2022-03-10-live",
+        "validFrom": "2022-03-10T20:58:10",
+        "validTo": "2022-03-24T16:49:09",
+        "buildId": "2022-03-10-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3854374252548638256"
+            }
+        ]
+    },
+    {
+        "name": "2022-03-24-live",
+        "validFrom": "2022-03-24T16:49:09",
+        "validTo": "2022-04-07T17:14:23",
+        "buildId": "2022-03-24-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "957438953711985125"
+            }
+        ]
+    },
+    {
+        "name": "2022-04-07-live",
+        "validFrom": "2022-04-07T17:14:23",
+        "validTo": "2022-05-02T20:19:35",
+        "buildId": "2022-04-07-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7130942180743771546"
+            }
+        ]
+    },
+    {
+        "name": "2022-05-02-live",
+        "validFrom": "2022-05-02T20:19:35",
+        "validTo": "2022-05-25T20:17:23",
+        "buildId": "2022-05-02-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "4293597205320849357"
+            }
+        ]
+    },
+    {
+        "name": "2022-05-25-live",
+        "validFrom": "2022-05-25T20:17:23",
+        "validTo": "2022-06-07T20:16:59",
+        "buildId": "2022-05-25-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "492125172254508432"
+            }
+        ]
+    },
+    {
+        "name": "2022-06-07-live",
+        "validFrom": "2022-06-07T20:16:59",
+        "validTo": "2022-06-14T19:57:45",
+        "buildId": "2022-06-07-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5852974823760428185"
+            }
+        ]
+    },
+    {
+        "name": "2022-06-14-live",
+        "validFrom": "2022-06-14T19:57:45",
+        "validTo": "2022-07-12T17:01:11",
+        "buildId": "2022-06-14-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6140359215317364454"
+            }
+        ]
+    },
+    {
+        "name": "2022-07-12-live",
+        "validFrom": "2022-07-12T17:01:11",
+        "validTo": "2022-07-25T20:22:13",
+        "buildId": "2022-07-12-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "1501541786309985901"
+            }
+        ]
+    },
+    {
+        "name": "2022-07-25-live",
+        "validFrom": "2022-07-25T20:22:13",
+        "validTo": "2022-08-04T17:25:07",
+        "buildId": "2022-07-25-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8232788497157700420"
+            }
+        ]
+    },
+    {
+        "name": "2022-08-04-live",
+        "validFrom": "2022-08-04T17:25:07",
+        "validTo": "2022-09-08T18:09:15",
+        "buildId": "2022-08-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "107373313239367256"
+            }
+        ]
+    },
+    {
+        "name": "2022-09-08-live",
+        "validFrom": "2022-09-08T18:09:15",
+        "validTo": "2022-09-13T17:17:15",
+        "buildId": "2022-09-08-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3794754729492060420"
+            }
+        ]
+    },
+    {
+        "name": "2022-09-13-live",
+        "validFrom": "2022-09-13T17:17:15",
+        "validTo": "2022-09-22T20:04:33",
+        "buildId": "2022-09-13-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7597787984481681207"
+            }
+        ]
+    },
+    {
+        "name": "2022-09-22-live",
+        "validFrom": "2022-09-22T20:04:33",
+        "validTo": "2022-10-25T16:16:29",
+        "buildId": "2022-09-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3320401198971485549"
+            }
+        ]
+    },
+    {
+        "name": "2022-10-25-live",
+        "validFrom": "2022-10-25T16:16:29",
+        "validTo": "2022-11-03T20:16:17",
+        "buildId": "2022-10-25-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7208807206475074267"
+            }
+        ]
+    },
+    {
+        "name": "2022-11-03-live",
+        "validFrom": "2022-11-03T20:16:17",
+        "validTo": "2022-12-01T18:27:26",
+        "buildId": "2022-11-03-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6991675894792151833"
+            }
+        ]
+    },
+    {
+        "name": "2022-12-01-live",
+        "validFrom": "2022-12-01T18:27:26",
+        "validTo": "2023-01-17T18:09:52",
+        "buildId": "2022-12-01-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "327523523209621081"
+            }
+        ]
+    },
+    {
+        "name": "2023-01-17-live",
+        "validFrom": "2023-01-17T18:09:52",
+        "validTo": "2023-01-19T21:26:16",
+        "buildId": "2023-01-17-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6027108263679999242"
+            }
+        ]
+    },
+    {
+        "name": "2023-01-19-live",
+        "validFrom": "2023-01-19T21:26:16",
+        "validTo": "2023-01-23T21:40:34",
+        "buildId": "2023-01-19-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3951691869488399004"
+            }
+        ]
+    },
+    {
+        "name": "2023-01-23-live",
+        "validFrom": "2023-01-23T21:40:34",
+        "validTo": "2023-02-16T18:18:38",
+        "buildId": "2023-01-23-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6060212329171388960"
+            }
+        ]
+    },
+    {
+        "name": "2023-02-16-live",
+        "validFrom": "2023-02-16T18:18:38",
+        "validTo": "2023-04-04T17:22:45",
+        "buildId": "2023-02-16-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7662526945187885132"
+            }
+        ]
+    },
+    {
+        "name": "2023-04-04-live",
+        "validFrom": "2023-04-04T17:22:45",
+        "validTo": "2023-05-04T17:16:05",
+        "buildId": "2023-04-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5080779718810776207"
+            }
+        ]
+    },
+    {
+        "name": "2023-05-04-live",
+        "validFrom": "2023-05-04T17:16:05",
+        "validTo": "2023-05-04T22:02:20",
+        "buildId": "2023-05-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8028575084739274198"
+            }
+        ]
+    },
+    {
+        "name": "2023-05-04-220220-live",
+        "validFrom": "2023-05-04T22:02:20",
+        "validTo": "2023-05-11T17:54:02",
+        "buildId": "2023-05-04-220220-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3725707230372984057"
+            }
+        ]
+    },
+    {
+        "name": "2023-05-11-live",
+        "validFrom": "2023-05-11T17:54:02",
+        "validTo": "2023-05-16T22:42:19",
+        "buildId": "2023-05-11-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5499472215543382323"
+            }
+        ]
+    },
+    {
+        "name": "2023-05-16-live",
+        "validFrom": "2023-05-16T22:42:19",
+        "validTo": "2023-06-15T17:22:18",
+        "buildId": "2023-05-16-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "837015513456842516"
+            }
+        ]
+    },
+    {
+        "name": "2023-06-15-live",
+        "validFrom": "2023-06-15T17:22:18",
+        "validTo": "2023-06-26T17:12:47",
+        "buildId": "2023-06-15-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "1018115647644153110"
+            }
+        ]
+    },
+    {
+        "name": "2023-06-26-live",
+        "validFrom": "2023-06-26T17:12:47",
+        "validTo": "2023-07-12T20:19:41",
+        "buildId": "2023-06-26-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2939523092902987903"
+            }
+        ]
+    },
+    {
+        "name": "2023-07-12-live",
+        "validFrom": "2023-07-12T20:19:41",
+        "validTo": "2023-07-20T17:20:33",
+        "buildId": "2023-07-12-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8275943127227295097"
+            }
+        ]
+    },
+    {
+        "name": "2023-07-20-live",
+        "validFrom": "2023-07-20T17:20:33",
+        "validTo": "2023-08-22T20:17:00",
+        "buildId": "2023-07-20-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8274508056575558357"
+            }
+        ]
+    },
+    {
+        "name": "2023-08-22-live",
+        "validFrom": "2023-08-22T20:17:00",
+        "validTo": "2023-09-05T17:09:45",
+        "buildId": "2023-08-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3066813949581397563"
+            }
+        ]
+    },
+    {
+        "name": "2023-09-05-live",
+        "validFrom": "2023-09-05T17:09:45",
+        "validTo": "2023-09-26T17:35:16",
+        "buildId": "2023-09-05-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2070187863320578613"
+            }
+        ]
+    },
+    {
+        "name": "2023-09-26-live",
+        "validFrom": "2023-09-26T17:35:16",
+        "validTo": "2023-11-14T17:55:44",
+        "buildId": "2023-09-26-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8735190132509542827"
+            }
+        ]
+    },
+    {
+        "name": "2023-11-14-live",
+        "validFrom": "2023-11-14T17:55:44",
+        "validTo": "2023-12-06T18:02:56",
+        "buildId": "2023-11-14-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5007532529966443534"
+            }
+        ]
+    },
+    {
+        "name": "2023-12-06-live",
+        "validFrom": "2023-12-06T18:02:56",
+        "validTo": "2023-12-11T17:53:58",
+        "buildId": "2023-12-06-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "1823750874062681804"
+            }
+        ]
+    },
+    {
+        "name": "2023-12-11-live",
+        "validFrom": "2023-12-11T17:53:58",
+        "validTo": "2024-01-30T18:06:11",
+        "buildId": "2023-12-11-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8482452267156635793"
+            }
+        ],
+        "version": 404
+    },
+    {
+        "name": "2024-01-30-live",
+        "validFrom": "2024-01-30T18:06:11",
+        "validTo": "2024-03-19T17:12:25",
+        "buildId": "2024-01-30-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7755248053066107972"
+            }
+        ],
+        "version": 628
+    },
+    {
+        "name": "2024-03-19-live",
+        "validFrom": "2024-03-19T17:12:25",
+        "validTo": "2024-03-27T20:05:08",
+        "buildId": "2024-03-19-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "4598253258567678658"
+            }
+        ],
+        "version": 576
+    },
+    {
+        "name": "2024-03-27-live",
+        "validFrom": "2024-03-27T20:05:08",
+        "validTo": "2024-07-18T16:47:36",
+        "buildId": "2024-03-27-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "4418245704074926004"
+            }
+        ]
+    },
+    {
+        "name": "2024-07-18-live",
+        "validFrom": "2024-07-18T16:47:36",
+        "validTo": "2024-08-22T16:26:49",
+        "buildId": "2024-07-18-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "1215615621862993720"
+            }
+        ],
+        "version": 782
+    },
+    {
+        "name": "2024-08-22-live",
+        "validFrom": "2024-08-22T16:26:49",
+        "validTo": "2024-09-17T15:41:20",
+        "buildId": "2024-08-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8243932669985673166"
+            }
+        ],
+        "version": 1201
+    },
+    {
+        "name": "2024-09-17-live",
+        "validFrom": "2024-09-17T15:41:20",
+        "validTo": "2024-10-22T16:32:48",
+        "buildId": "2024-09-17-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2328888716375198694"
+            }
+        ]
+    },
+    {
+        "name": "2024-10-22-live",
+        "validFrom": "2024-10-22T16:32:48",
+        "validTo": "2024-10-31T22:19:56",
+        "buildId": "2024-10-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7052073412916966003"
+            }
+        ],
+        "version": 1974
+    },
+    {
+        "name": "2024-10-31-live",
+        "validFrom": "2024-10-31T22:19:56",
+        "validTo": "2024-11-19T17:11:03",
+        "buildId": "2024-10-31-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "4027071909540723520"
+            }
+        ],
+        "version": 2246
+    },
+    {
+        "name": "2024-11-19-live",
+        "validFrom": "2024-11-19T17:11:03",
+        "validTo": "2024-12-03T17:07:30",
+        "buildId": "2024-11-19-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "151320921730154340"
+            }
+        ],
+        "version": 2454
+    },
+    {
+        "name": "2024-12-03-live",
+        "validFrom": "2024-12-03T17:07:30",
+        "validTo": "2025-02-13T17:13:23",
+        "buildId": "2024-12-03-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3798853880512976127"
+            }
+        ],
+        "version": 2638
+    },
+    {
+        "name": "2025-02-13-live",
+        "validFrom": "2025-02-13T17:13:23",
+        "validTo": "2025-04-08T17:00:47",
+        "buildId": "2025-02-13-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7485643386354804331"
+            }
+        ],
+        "version": 3327
+    },
+    {
+        "name": "2025-04-08-live",
+        "validFrom": "2025-04-08T17:00:47",
+        "validTo": "2025-04-09T20:05:31",
+        "buildId": "2025-04-08-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8628314603122737639"
+            }
+        ]
+    },
+    {
+        "name": "2025-04-09-live",
+        "validFrom": "2025-04-09T20:05:31",
+        "validTo": "2025-04-22T17:13:05",
+        "buildId": "2025-04-09-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "9158832167332615081"
+            }
+        ]
+    },
+    {
+        "name": "2025-04-22-live",
+        "validFrom": "2025-04-22T17:13:05",
+        "validTo": "2025-05-13T16:09:01",
+        "buildId": "2025-04-22-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3660895483654482496"
+            }
+        ],
+        "version": 4420
+    },
+    {
+        "name": "2025-05-13-live",
+        "validFrom": "2025-05-13T16:09:01",
+        "validTo": "2025-06-26T16:10:36",
+        "buildId": "2025-05-13-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "3927554668606200914"
+            }
+        ],
+        "version": 4553
+    },
+    {
+        "name": "2025-06-26-live",
+        "validFrom": "2025-06-26T16:10:36",
+        "validTo": "2025-07-16T13:31:42",
+        "buildId": "2025-06-26-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "875672865492017354"
+            }
+        ],
+        "version": 4963
+    },
+    {
+        "name": "2025-07-16-live",
+        "validFrom": "2025-07-16T13:31:42",
+        "validTo": "2025-10-30T17:26:25",
+        "buildId": "2025-07-16-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2401589128625858962"
+            }
+        ],
+        "version": 5602
+    },
+    {
+        "name": "2025-10-30-live",
+        "validFrom": "2025-10-30T17:26:25",
+        "validTo": "2025-11-04T18:12:57",
+        "buildId": "2025-10-30-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8760690707263758253"
+            }
+        ],
+        "version": 6970
+    },
+    {
+        "name": "2025-11-04-live",
+        "validFrom": "2025-11-04T18:12:57",
+        "validTo": "2025-11-12T18:11:29",
+        "buildId": "2025-11-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6699141327912681795"
+            }
+        ],
+        "version": 7064
+    },
+    {
+        "name": "2025-11-12-live",
+        "validFrom": "2025-11-12T18:11:29",
+        "validTo": "2025-12-04T18:15:44",
+        "buildId": "2025-11-12-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "8155469786165116110"
+            }
+        ],
+        "version": 7149
+    },
+    {
+        "name": "2025-12-04-live",
+        "validFrom": "2025-12-04T18:15:44",
+        "validTo": "2025-12-08T23:33:25",
+        "buildId": "2025-12-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "2047515838866205950"
+            }
+        ],
+        "version": 7380
+    },
+    {
+        "name": "2025-12-08-live",
+        "validFrom": "2025-12-08T23:33:25",
+        "validTo": "2026-02-04T17:09:27",
+        "buildId": "2025-12-08-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "6637439234011133234"
+            }
+        ],
+        "version": 7445
+    },
+    {
+        "name": "2026-02-04-live",
+        "validFrom": "2026-02-04T17:09:27",
+        "validTo": "2026-03-04T21:12:53",
+        "buildId": "2026-02-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "4277730070167966159"
+            }
+        ],
+        "version": 8338
+    },
+    {
+        "name": "2026-03-04-live",
+        "validFrom": "2026-03-04T21:12:53",
+        "validTo": "2026-05-07T17:00:59",
+        "buildId": "2026-03-04-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "7753040208265046254"
+            }
+        ],
+        "version": 8719
+    },
+    {
+        "name": "2026-05-07-live",
+        "validFrom": "2026-05-07T17:00:59",
+        "validTo": "2026-05-12T16:09:57",
+        "buildId": "2026-05-07-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5373540070813065117"
+            }
+        ],
+        "version": 9737
+    },
+    {
+        "name": "2026-05-12-live",
+        "validFrom": "2026-05-12T16:09:57",
+        "validTo": "2026-06-01T21:11:46",
+        "buildId": "2026-05-12-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5816376800768081265"
+            }
+        ],
+        "version": 10056
+    },
+    {
+        "name": "2026-06-01-live",
+        "validFrom": "2026-06-01T21:11:46",
+        "validTo": null,
+        "buildId": "2026-06-01-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5901486414819026351"
+            }
+        ],
+        "version": 10604
+    }
+]

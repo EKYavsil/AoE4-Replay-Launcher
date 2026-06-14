@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Binary test fixtures must never be line-ending normalised (it corrupts them).
+*.bin binary
+tests/fixtures/** binary

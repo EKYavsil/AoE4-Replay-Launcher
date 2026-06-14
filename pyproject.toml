@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aoe4-replay-launcher"
+version = "0.1.0"
+description = "Watch old Age of Empires IV replays by reconstructing the exact game build they were recorded on, with content-defined deduplication of build assets."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Zavarash" }]
+keywords = ["age-of-empires", "aoe4", "replay", "steam", "depot", "restic", "deduplication"]
+dependencies = [
+    "typer>=0.12",
+    "customtkinter>=5.2",  # replay download/launch panel (cli panel)
+    "pillow>=10.0",        # UI image loading (PNG/WebP assets)
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "babel>=2.12",  # only to regenerate the CLDR date table (scripts/gen_cldr.py)
+]
+
+[project.scripts]
+aoe4replay = "aoe4replay.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/EKYavsil/AoE4-Replay-Launcher"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aoe4replay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

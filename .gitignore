@@ -1,0 +1,65 @@
+# --- restic deduplicated build store (can be tens of GB; never commit) ---
+/repo/
+*.restic-repo/
+
+# --- external binaries (auto-downloaded / manually installed; not redistributed) ---
+/tools/
+*.exe
+
+# --- local, machine-specific config (may contain your Steam username) ---
+config.local.toml
+config.toml
+
+# --- restic repository password (auto-generated; losing it makes the repo unreadable) ---
+.restic-password
+
+# --- replay files imported or downloaded by the panel (user data) ---
+*.rec
+AgeIV_Replay_*
+/downloads/
+
+# --- transient launch / restore / work directories ---
+/launch_work/
+/.aoe4-restore/
+/.aoe4-work/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- exe build / release artifacts (uploaded as a GitHub release asset, never committed) ---
+# The PyInstaller onedir output, the packaged zip, the build work dir (build/ above),
+# the exe (*.exe above), and the entire packaging/ folder (the .spec, entry script,
+# icon generator, and the generated app.ico) — nothing about building the exe is tracked.
+/dist/
+*.zip
+/packaging/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- exe-version harvest cache (local runtime) ---
+/.exever/
+
+# --- kept local only: tests and any audit / report / scratch notes ---
+/tests/
+*_REPORT*.md
+*_AUDIT*.md
+*AUDIT_REPORT*.md
+UI_MESSAGES*.md
+NOTES*.md
+*.tmp
+.gitmsg.tmp
