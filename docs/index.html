@@ -46,7 +46,7 @@
           Age of Empires IV replays only work with the exact game build they were recorded on. AoE4 Replay Launcher identifies that build, reconstructs it from official Steam depot files, and launches the game on the replay's original date so the historical version runs correctly.
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download for Windows</a>
+          <a class="button primary js-download" href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download for Windows</a>
           <a class="button secondary" href="https://github.com/EKYavsil/AoE4-Replay-Launcher">View repository</a>
         </div>
       </div>
@@ -63,7 +63,7 @@
       </div>
       <div>
         <span class="status-label">Latest release</span>
-        <strong>v1.0.0</strong>
+        <strong id="latest-release">v1.1.0</strong>
       </div>
     </section>
 
@@ -220,7 +220,7 @@ launch on the replay's original date</code></pre>
         </div>
       </div>
       <div class="link-row">
-        <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download latest release</a>
+        <a class="js-download" href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download latest release</a>
         <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher#readme">Read the README</a>
         <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher">Source code</a>
       </div>
@@ -269,5 +269,31 @@ launch on the replay's original date</code></pre>
     <p>An independent, unofficial AoE4 Replay Launcher project. Not affiliated with or endorsed by Microsoft, World's Edge, Relic Entertainment, Steam, or Valve.</p>
     <p><a href="https://github.com/EKYavsil/AoE4-Replay-Launcher">Repository</a></p>
   </footer>
+
+  <script>
+    // Keep the page in sync with GitHub's latest release automatically:
+    //  - update the "Latest release" label (falls back to the hard-coded value),
+    //  - upgrade the download buttons to a one-click direct download when the
+    //    portable asset exists; otherwise they keep pointing at the release page
+    //    (the safe default already in their href), so they never 404.
+    fetch("https://api.github.com/repos/EKYavsil/AoE4-Replay-Launcher/releases/latest")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        if (d.tag_name) {
+          document.getElementById("latest-release").textContent = d.tag_name;
+        }
+        var asset = (d.assets || []).filter(function (a) {
+          return a.name === "AoE4ReplayLauncher-win-Portable.zip";
+        })[0];
+        if (asset && asset.browser_download_url) {
+          var links = document.querySelectorAll(".js-download");
+          for (var i = 0; i < links.length; i++) {
+            links[i].href = asset.browser_download_url;
+          }
+        }
+      })
+      .catch(function () { /* offline / rate-limited: keep the safe defaults */ });
+  </script>
 </body>
 </html>

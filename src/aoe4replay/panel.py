@@ -304,6 +304,8 @@ class Panel(ctk.CTk):
         threading.Thread(
             target=lambda: service.sync_build_map(self.cfg), daemon=True
         ).start()
+        # check for a newer app release in the background (Velopack auto-update)
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
     # ---- Steam sign-in ----------------------------------------------------
 
@@ -2302,6 +2304,56 @@ class Panel(ctk.CTk):
             buildcache.mark_saved(self.cfg, build_id)
             self.status.configure(text=f"Saved {build_id} for instant replays.")
             self._refresh_saved_builds()
+
+    # ---- auto-update (Velopack) ------------------------------------------
+
+    def _check_for_updates(self) -> None:
+        """Background check for a newer release; offer to install if found.
+
+        Silent no-op when not running as a Velopack install (dev/source run,
+        the legacy build, or offline) — UpdateManager raises in those cases.
+        """
+        try:
+            import velopack
+
+            mgr = velopack.UpdateManager(velopack.GithubSource(INFO_GITHUB_URL, None, False))
+            info = mgr.check_for_updates()
+        except Exception:  # noqa: BLE001 - an update check must never break startup
+            return
+        if not info:
+            return
+        self.after(0, lambda: self._offer_update(mgr, info))
+
+    def _offer_update(self, mgr, info) -> None:
+        version = ""
+        with contextlib.suppress(Exception):
+            version = str(info.target_full_release.version)
+        label = f" ({version})" if version else ""
+        if not self._confirm(
+            "Update available",
+            f"A new version{label} of AoE4 Replay Launcher is available.\n\n"
+            "Your downloaded builds, saved builds and settings are kept — only the "
+            "app itself is updated. Update now?",
+            ok="Update", cancel="Later",
+        ):
+            return
+        threading.Thread(target=lambda: self._run_update(mgr, info), daemon=True).start()
+
+    def _run_update(self, mgr, info) -> None:
+        def progress(pct: int) -> None:
+            self.after(0, lambda p=pct: self.status.configure(text=f"Downloading update… {int(p)}%"))
+
+        try:
+            self.after(0, lambda: self.status.configure(text="Downloading update…"))
+            mgr.download_updates(info, progress)
+            self.after(0, lambda: self.status.configure(text="Installing update…"))
+            mgr.apply_updates_and_restart(info)  # exits and relaunches the new version
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda e=exc: self._error(
+                "Update failed",
+                f"The update could not be applied:\n{e}\n\nYou can still download the "
+                "latest version manually from the Releases page.",
+            ))
 
 
 _single_instance_handle = None  # kept alive for the process lifetime

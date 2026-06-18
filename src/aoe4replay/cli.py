@@ -147,6 +147,36 @@ def panel(config_path: ConfigOpt = None) -> None:
     panel_module.run(_load(config_path))
 
 
+_GITHUB_REPO_URL = "https://github.com/EKYavsil/AoE4-Replay-Launcher"
+
+
+@app.command()
+def update(
+    source: Annotated[
+        str | None,
+        typer.Option("--source", help="Override update source (URL or local dir; for testing)"),
+    ] = None,
+) -> None:
+    """Check for and install an application update (packaged release only)."""
+    try:
+        import velopack
+    except ImportError:
+        _fail("Updates are only available in the packaged release.")
+    src = source if source else velopack.GithubSource(_GITHUB_REPO_URL, None, False)
+    try:
+        manager = velopack.UpdateManager(src)
+        info = manager.check_for_updates()
+    except Exception as exc:  # noqa: BLE001
+        _fail(f"Update check failed: {exc}")
+    if not info:
+        typer.echo("You're on the latest version.")
+        return
+    typer.echo("Downloading update...")
+    manager.download_updates(info)
+    typer.echo("Applying update and restarting...")
+    manager.apply_updates_and_restart(info)
+
+
 @app.command()
 def version() -> None:
     """Print the version."""

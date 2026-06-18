@@ -105,14 +105,25 @@ def _seed_runtime_data(root: Path) -> None:
 def _frozen_root() -> Path:
     """Writable data root for the packaged exe.
 
-    Portable by default: data lives next to the exe. If that folder isn't
-    writable (e.g. the exe was placed under Program Files), fall back to
-    ``%APPDATA%\\AoE4ReplayLauncher`` so the launcher still works.
+    Velopack (our installer / auto-update framework) runs the app from
+    ``<RootAppDir>/current/`` and **replaces that whole ``current`` folder on
+    every update**, so all persistent data (config, build map, the multi-GB
+    restic repo, downloads, tools) must live in ``RootAppDir`` — one level up —
+    which Velopack preserves across updates. We detect a Velopack install by its
+    ``sq.version`` marker next to the exe (or ``Update.exe`` in RootAppDir).
+
+    Without Velopack (legacy plain-PyInstaller portable build) data stays next to
+    the exe as before. If neither location is writable (e.g. under Program Files),
+    fall back to ``%LocalAppData%\\AoE4ReplayLauncher``.
     """
     exe_dir = Path(sys.executable).resolve().parent
+    root_app_dir = exe_dir.parent
+    is_velopack = (exe_dir / "sq.version").is_file() or (root_app_dir / "Update.exe").is_file()
+    if is_velopack and _writable_dir(root_app_dir):
+        return root_app_dir
     if _writable_dir(exe_dir):
         return exe_dir
-    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
     root = Path(base) / "AoE4ReplayLauncher"
     root.mkdir(parents=True, exist_ok=True)
     return root
