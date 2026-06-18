@@ -284,7 +284,7 @@ launch on the replay's original date</code></pre>
           document.getElementById("latest-release").textContent = d.tag_name;
         }
         var asset = (d.assets || []).filter(function (a) {
-          return a.name === "AoE4ReplayLauncher-win-Portable.zip";
+          return a.name === "AoE4ReplayLauncher.zip";
         })[0];
         if (asset && asset.browser_download_url) {
           var links = document.querySelectorAll(".js-download");
