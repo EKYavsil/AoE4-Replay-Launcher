@@ -414,6 +414,10 @@ def _delta_seed(
         return seeded
     except DownloadCancelled:
         raise  # a user cancel is not an optimisation failure — let it propagate
+    except SteamAuthError:
+        raise  # an expired/dead Steam login is real, not an optimisation failure —
+        # surface it so the panel clears the stale login and prompts a reconnect,
+        # rather than falling through to a full download that hits the same wall.
     except Exception as exc:  # noqa: BLE001 - chunk reuse is an optimisation, never fatal
         print(f"Chunk delta seed skipped ({exc}); downloading full files.")
         return 0

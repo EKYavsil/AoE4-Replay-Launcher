@@ -2073,7 +2073,9 @@ class Panel(ctk.CTk):
                 error = str(exc)
             self.after(
                 0,
-                lambda: self._play_finished(error, warning, built, cancelled, auth_failed),
+                lambda: self._play_finished(
+                    error, warning, built, cancelled, auth_failed, path
+                ),
             )
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2242,6 +2244,7 @@ class Panel(ctk.CTk):
         built_build_id: str | None = None,
         cancelled: bool = False,
         auth_failed: bool = False,
+        path: Path | None = None,
     ) -> None:
         self._playing = False
         self._cancel_event = None
@@ -2253,17 +2256,17 @@ class Panel(ctk.CTk):
             self.status.configure(text="Download cancelled.")
             return
         if auth_failed:
-            # Clear the stale saved login so the next Play reconnects instead of
-            # silently failing again with the same expired token.
+            # The saved Steam login expired/was rejected. Clear it and open the
+            # connect dialog straight away (instead of a "press Play again" notice),
+            # then retry the same replay automatically once reconnected.
             with contextlib.suppress(Exception):
                 config.set_steam_username(self.cfg.project_root, "")
                 self.cfg = config.load()
-            self.status.configure(text="Steam login expired.")
-            self._info(
-                "Reconnect Steam",
-                "Your saved Steam sign-in has expired or was rejected. Press Play "
-                "again to reconnect your account.",
-            )
+            self.status.configure(text="Steam login expired — reconnect to continue.")
+            if path is not None:
+                self._prompt_steam_login(
+                    on_success=lambda: self._start_play(path, just_connected=True)
+                )
             return
         if error:
             self.status.configure(text="Playback failed.")

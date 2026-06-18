@@ -277,6 +277,7 @@ def _run_capturing(
     """
     proc = subprocess.Popen(  # noqa: S603
         [str(exe), *args],
+        stdin=subprocess.DEVNULL,  # never let a stale-login password prompt block forever
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
