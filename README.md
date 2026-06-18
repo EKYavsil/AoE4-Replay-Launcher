@@ -13,6 +13,17 @@ or Steam sign-in required.
 
 > **Windows only.** Requires a legitimately owned Steam copy of Age of Empires IV.
 
+## Download
+
+### [⬇️ Download AoE4 Replay Launcher](https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest/download/AoE4ReplayLauncher.zip)
+
+Download the ZIP, extract the **entire folder** to a writable location such as
+your Desktop, and run **`AoE4 Replay Launcher.exe`** (in the main folder). The
+launcher updates itself automatically when new versions are released.
+
+> The application is not code-signed. Windows SmartScreen may appear on first
+> launch. Select **More info**, then **Run anyway**.
+
 ![AoE4 Replay Launcher](docs/main.png)
 
 ## Highlights
@@ -24,6 +35,7 @@ or Steam sign-in required.
   [restic](https://restic.net/) repository.
 - Cache builds for reuse or save selected builds for instant offline playback.
 - Automatically update the replay-to-build map as new patches are released.
+- Keep itself up to date—the launcher checks for and installs new releases on startup.
 
 ## How it works
 
@@ -83,7 +95,7 @@ name may be cached locally so future downloads can run without another sign-in.
 
 ## Desktop panel
 
-Open **`AoE4-Replay-Launcher.exe`** from a release build, or
+Open **`AoE4 Replay Launcher.exe`** from a release build, or
 **`AoE4-Replay-Launcher.vbs`** from a source installation.
 
 The panel can:
@@ -101,16 +113,19 @@ The panel can:
 
 ### Release build—no Python or setup required
 
-1. Download the latest **AoE4 Replay Launcher** release from the
-   [Releases](https://github.com/EKYavsil/aoe4-replay-launcher/releases) page.
+1. [Download the latest **AoE4 Replay Launcher ZIP**](https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest/download/AoE4ReplayLauncher.zip).
+   You can also visit the [Releases](https://github.com/EKYavsil/AoE4-Replay-Launcher/releases)
+   page to view previous versions and release notes.
 2. Extract the **entire folder** to a writable location such as your Desktop.
    Do not run it from inside the archive or place it under `Program Files`.
-3. Double-click **`AoE4-Replay-Launcher.exe`**.
+3. Double-click **`AoE4 Replay Launcher.exe`** (in the main folder — not the
+   `AoE4ReplayLauncher-core.exe` inside the `current` subfolder).
 
 Keep the extracted folder together. The application stores its configuration,
-downloaded tools, replay data, and restic repository beside the executable.
-Python is not required; external tools are downloaded from their official
-sources when first needed.
+downloaded tools, replay data, and restic repository inside this folder, and it
+updates itself automatically when new versions are released. Python is not
+required; external tools are downloaded from their official sources when first
+needed.
 
 The release is not code-signed. On first run, Windows SmartScreen may display
 **“Windows protected your PC.”** Select **More info**, then **Run anyway**. This
@@ -120,8 +135,8 @@ commercial code-signing certificate.
 ### From source—developers and advanced users
 
 ```console
-git clone https://github.com/EKYavsil/aoe4-replay-launcher
-cd aoe4-replay-launcher
+git clone https://github.com/EKYavsil/AoE4-Replay-Launcher
+cd AoE4-Replay-Launcher
 ```
 
 Run **`setup.bat`**. It locates Python 3.12 or newer—or offers to install it
