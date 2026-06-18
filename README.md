@@ -13,6 +13,8 @@ or Steam sign-in required.
 
 > **Windows only.** Requires a legitimately owned Steam copy of Age of Empires IV.
 
+![AoE4 Replay Launcher](docs/main.png)
+
 ## Highlights
 
 - Find, download, import, and play replays from a desktop panel.

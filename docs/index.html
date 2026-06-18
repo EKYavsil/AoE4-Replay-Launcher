@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b1017">
+  <meta name="description" content="AoE4 Replay Launcher is a free, open-source Windows tool that watches old Age of Empires IV replays the current patch can no longer open. It reconstructs the exact historical game build from official Steam depots and launches the game on the replay's original date.">
+  <meta property="og:title" content="AoE4 Replay Launcher — Watch Old Age of Empires IV Replays">
+  <meta property="og:description" content="Play Age of Empires IV replays from older patches by reconstructing the exact game build they were recorded on, with deduplicated storage of historical builds.">
+  <meta name="twitter:title" content="AoE4 Replay Launcher — Watch Old Age of Empires IV Replays">
+  <meta name="twitter:description" content="Free, open-source Windows launcher that reconstructs historical AoE4 builds from Steam depots so old replays play again.">
+  <title>AoE4 Replay Launcher — Watch Old Age of Empires IV Replays</title>
+  <link rel="stylesheet" href="assets/site.css">
+  <style>
+    /* Page-specific: the hero media is a UI screenshot, so show all of it
+       (contain) centred and crisp instead of cropping/darkening it. */
+    .hero-media { background: #0b1017; align-items: center; justify-content: center; display: flex; }
+    .hero-media img { width: 100%; height: 100%; object-fit: contain; filter: none; padding: 24px; }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <nav class="nav" aria-label="Primary navigation">
+      <a class="brand" href="#top">AoE4 Replay Launcher</a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#storage">Storage</a>
+        <a href="#download">Download</a>
+        <a href="#faq">FAQ</a>
+        <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-media" aria-hidden="true">
+        <img src="main.png" alt="">
+      </div>
+      <div class="hero-content">
+        <p class="eyebrow">Age of Empires IV replay launcher</p>
+        <h1>Watch old Age of Empires IV replays the current patch can't open</h1>
+        <p class="hero-copy">
+          Age of Empires IV replays only work with the exact game build they were recorded on. AoE4 Replay Launcher identifies that build, reconstructs it from official Steam depot files, and launches the game on the replay's original date so the historical version runs correctly.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download for Windows</a>
+          <a class="button secondary" href="https://github.com/EKYavsil/AoE4-Replay-Launcher">View repository</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="status-band" aria-label="Project status">
+      <div>
+        <span class="status-label">Platform</span>
+        <strong>Windows (Steam copy required)</strong>
+      </div>
+      <div>
+        <span class="status-label">License</span>
+        <strong>Free &amp; open-source (MIT)</strong>
+      </div>
+      <div>
+        <span class="status-label">Latest release</span>
+        <strong>v1.0.0</strong>
+      </div>
+    </section>
+
+    <section class="section intro">
+      <div class="section-heading">
+        <p class="eyebrow">What it is</p>
+        <h2>Replays from old patches play again, no manual downgrade required.</h2>
+      </div>
+      <div class="text-block">
+        <p>
+          After a patch, Age of Empires IV replays (<code>.rec</code>) recorded on earlier builds usually fail to open. This launcher rebuilds the precise historical version each replay needs from official Steam depot files, then runs the game through it.
+        </p>
+        <p>
+          Replays recorded on your currently installed patch open immediately — no download or Steam sign-in required. Everything is bundled in the release: you do not need Python or any manual setup, and external tools are fetched from their official sources only when first needed.
+        </p>
+      </div>
+    </section>
+
+    <section id="features" class="section technical">
+      <div class="section-heading">
+        <p class="eyebrow">Features</p>
+        <h2>Find, reconstruct, and play any available replay from one desktop panel.</h2>
+      </div>
+      <div class="technical-grid">
+        <article class="panel">
+          <h3>Find &amp; download replays</h3>
+          <p>
+            Look up a player by name or profile ID and browse their games page by page, filter by date, or list head-to-head matches between two players — with date, mode, map, civilizations, and winner.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Exact build reconstruction</h3>
+          <p>
+            Each replay is matched to the exact historical game build it was recorded on, identified by the recorded executable version so the resolution is locale-independent.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Deduplicated storage</h3>
+          <p>
+            Historical build data is stored in a deduplicated <a href="https://restic.net/">restic</a> repository, so consecutive builds share most of their underlying data instead of keeping a full copy each.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Cache &amp; save builds</h3>
+          <p>
+            Composed builds are cached while the launcher is open, and you can save selected builds to keep them across sessions for instant, offline playback.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Self-updating build map</h3>
+          <p>
+            A scheduled job records newly released Steam manifests and the launcher refreshes its replay-to-build map at startup, so new patches are supported without a new app release.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Private Steam sign-in</h3>
+          <p>
+            Sign-in is requested only when historical files must be downloaded. The recommended Steam Mobile QR flow needs no password in the launcher, and your Steam password is never stored.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="how" class="section">
+      <div class="section-heading">
+        <p class="eyebrow">How it works</p>
+        <h2>From a replay file to a launchable historical build.</h2>
+      </div>
+      <div class="text-block">
+        <p>
+          The launcher reads the build recorded in the replay, resolves the matching Steam depot manifest, downloads only the files that differ from your live installation, and stores that delta in restic. At launch it composes the historical build by hardlinking unchanged files from your normal install and combining them with the restored delta — then starts the game on the replay's original date.
+        </p>
+      </div>
+      <div class="code-panel">
+        <p class="code-title">The reconstruction pipeline</p>
+        <pre><code>replay.rec
+   |  read the recorded game build
+   v
+build map ---------> resolve the Steam depot manifest
+   |
+   v
+Steam depots ------> download only the required historical delta
+   |
+   v
+restic repository -> restore the build's delta
+   |
+   v
+compose = current Steam install (hardlinked seed)
+        + restored historical delta (hardlinked)
+   |
+   v
+launch on the replay's original date</code></pre>
+      </div>
+    </section>
+
+    <section id="storage" class="section technical">
+      <div class="section-heading">
+        <p class="eyebrow">Storage &amp; deduplication</p>
+        <h2>A year of historical builds, without a full copy for every patch.</h2>
+      </div>
+      <div class="text-block">
+        <p>
+          Age of Empires IV asset archives (<code>.sga</code>) make up most of the build cache and are already compressed, so ordinary compression adds little. The real reduction comes from content-defined deduplication: consecutive versions of the same archives share most of their underlying data.
+        </p>
+      </div>
+      <div class="technical-grid">
+        <article class="panel">
+          <h3>Raw delta data</h3>
+          <p>Approximately <strong>140 GB</strong> across roughly one year of historical builds.</p>
+        </article>
+        <article class="panel">
+          <h3>Stored after dedup</h3>
+          <p>Approximately <strong>55 GB</strong> on disk in the restic repository.</p>
+        </article>
+        <article class="panel">
+          <h3>Disk space saved</h3>
+          <p>About <strong>61%</strong> — and unchanged files are hardlinked from your live install at launch.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section warning-section">
+      <div class="section-heading">
+        <p class="eyebrow">Before you run it</p>
+        <h2>The release is unsigned, so Windows SmartScreen may warn on first launch.</h2>
+      </div>
+      <div class="text-block">
+        <p>
+          This is an independently distributed open-source application without a commercial code-signing certificate. On first run, Windows SmartScreen may show <strong>"Windows protected your PC."</strong> Select <strong>More info</strong>, then <strong>Run anyway</strong>. This is expected and the source is fully available for review.
+        </p>
+        <p>
+          AoE4 Replay Launcher does not distribute Age of Empires IV game files. Historical files are downloaded directly from Steam, for users who own the game, and remain subject to the applicable Steam and game terms.
+        </p>
+      </div>
+    </section>
+
+    <section id="download" class="section repair">
+      <div class="section-heading">
+        <p class="eyebrow">Get started</p>
+        <h2>Download, extract, and double-click — no Python or setup needed.</h2>
+      </div>
+      <div class="repair-list">
+        <div>
+          <span class="step">01</span>
+          <p>Download the latest release zip from the <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Releases</a> page.</p>
+        </div>
+        <div>
+          <span class="step">02</span>
+          <p>Extract the <strong>entire folder</strong> to a writable location such as your Desktop. Keep the exe and its <code>_internal</code> folder together; don't run from inside the archive or under <code>Program Files</code>.</p>
+        </div>
+        <div>
+          <span class="step">03</span>
+          <p>Double-click <code>AoE4-Replay-Launcher.exe</code>. Performance depends mainly on your internet connection (downloads) and your SSD/disk (build composition).</p>
+        </div>
+      </div>
+      <div class="link-row">
+        <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher/releases/latest">Download latest release</a>
+        <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher#readme">Read the README</a>
+        <a href="https://github.com/EKYavsil/AoE4-Replay-Launcher">Source code</a>
+      </div>
+    </section>
+
+    <section id="faq" class="section technical">
+      <div class="section-heading">
+        <p class="eyebrow">FAQ</p>
+        <h2>Common questions about playing old Age of Empires IV replays.</h2>
+      </div>
+      <div class="technical-grid">
+        <article class="panel">
+          <h3>Do I need Python or any setup?</h3>
+          <p>
+            No. The release is a self-contained Windows build — download, extract, and run. External tools (restic, DepotDownloader, RunAsDate) download automatically from their official sources on first use.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Do I need to own the game?</h3>
+          <p>
+            Yes. A legitimately owned Steam copy of Age of Empires IV is required; Steam will only provide historical depot files to an account that owns the game.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Does it modify my game install?</h3>
+          <p>
+            No. Historical builds are composed in a separate working area by hardlinking unchanged files from your live install and adding the restored delta. Your normal installation is left intact.
+          </p>
+        </article>
+        <article class="panel">
+          <h3>Why does it ask me to sign in to Steam?</h3>
+          <p>
+            Only when files from a historical build must be downloaded. The recommended Steam Mobile QR flow approves the sign-in in the Steam app without entering a password into the launcher, and the password is never stored.
+          </p>
+        </article>
+      </div>
+      <div class="text-block">
+        <p>
+          Search terms that may describe this tool include Age of Empires IV old replay, AoE4 replay not working after patch, play old AoE4 replays, watch outdated replay, and reconstruct historical AoE4 build.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>An independent, unofficial AoE4 Replay Launcher project. Not affiliated with or endorsed by Microsoft, World's Edge, Relic Entertainment, Steam, or Valve.</p>
+    <p><a href="https://github.com/EKYavsil/AoE4-Replay-Launcher">Repository</a></p>
+  </footer>
+</body>
+</html>
