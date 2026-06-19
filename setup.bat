@@ -24,18 +24,32 @@ set /p "ANS=Install Python 3.13 now using winget? [Y/N] "
 if /i not "%ANS%"=="Y" goto :manual_python
 
 echo.
-echo  Installing Python 3.13 via winget (follow any prompts it shows)...
+echo  Installing Python 3.13 via winget...
+echo  ^(If Windows shows a permission/UAC prompt, choose Yes - otherwise the
+echo   install cannot complete.^)
 winget install -e --id Python.Python.3.13 --accept-package-agreements --accept-source-agreements
+if errorlevel 1 goto :winget_failed
 
 call :detect_python
 if defined PYEXE goto :have_python
 
 echo.
-echo  Python was installed, but this window cannot see it yet.
+echo  Python was installed, but this window cannot see it yet ^(PATH not refreshed^).
 echo  Please CLOSE this window and double-click setup.bat again.
 echo.
 pause
 exit /b 0
+
+:winget_failed
+echo.
+echo  Python installation did not complete. This usually means a Windows
+echo  permission ^(UAC^) prompt was declined, or this account cannot install apps.
+echo  Run setup.bat again and choose Yes on the prompt, or install Python 3.12+
+echo  manually from  https://www.python.org/downloads/  ^(tick "Add python.exe
+echo   to PATH"^), then run setup.bat again.
+echo.
+pause
+exit /b 1
 
 :no_winget
 echo  ^(winget is not available on this PC.^)

@@ -143,6 +143,13 @@ Run **`setup.bat`**. It locates Python 3.12 or newer—or offers to install it
 through `winget`—creates a virtual environment, installs the project in editable
 mode, and creates `config.local.toml`.
 
+> If Python isn't already installed, the `winget` step may show a Windows
+> permission (UAC) prompt—choose **Yes**, otherwise the Python install can't
+> complete. Alternatively, install Python 3.12+ manually from
+> [python.org](https://www.python.org/downloads/) (tick *Add python.exe to
+> PATH*) first, then run `setup.bat`. Creating the virtual environment and
+> installing the project themselves need no special permissions.
+
 Because the project is installed in editable mode, changes from `git pull` take
 effect without running setup again.
 

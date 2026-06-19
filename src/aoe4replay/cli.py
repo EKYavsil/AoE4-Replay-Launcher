@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Annotated
 
@@ -34,6 +35,73 @@ def _fail(message: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _enable_terminal_colors() -> None:
+    """Turn on ANSI escape processing for the Windows console so the QR renders
+    (modern terminals already do this; best-effort, never fatal)."""
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # VT processing
+
+
+def _steam_login_cli(cfg: config.Config) -> None:
+    """Interactive Steam QR sign-in for the terminal.
+
+    Renders the sign-in QR right in the console (scan it with the Steam Mobile
+    App) and caches the account so later downloads run without another sign-in.
+    This is what the CLI was missing: a download used to wait silently for a QR
+    scan that was never shown.
+    """
+    from . import service, steamqr
+
+    _enable_terminal_colors()
+    typer.echo(
+        "Steam sign-in is required to download historical build files.\n"
+        "In the Steam Mobile App, open Steam Guard and scan this QR code:\n"
+    )
+    refreshed = {"n": 0}
+
+    def on_qr(matrix: list[list[bool]]) -> None:
+        if refreshed["n"]:
+            typer.echo("\nThe code refreshed — scan the new one below:\n")
+        refreshed["n"] += 1
+        typer.echo(steamqr.matrix_to_terminal(matrix))
+        typer.echo("\nWaiting for you to scan and approve in the Steam app...")
+
+    def on_approved() -> None:
+        typer.echo("Approved — finishing sign-in...")
+
+    try:
+        account = service.steam_login_qr(cfg, on_qr, on_approved)
+    except _EXPECTED_ERRORS as exc:
+        _fail(str(exc))
+    if not account:
+        _fail("Steam sign-in did not complete. Please try again.")
+    config.set_steam_username(cfg.project_root, account)
+    typer.echo(f"Signed in as {account}.")
+
+
+def _ensure_steam_login(
+    cfg: config.Config, replay: Path, config_path: Path | None
+) -> config.Config:
+    """Sign in to Steam before a download that would otherwise hang on an unseen
+    QR prompt. Skips sign-in when nothing needs downloading — a login is already
+    cached, or the replay plays offline from a build saved locally."""
+    if cfg.steam_username:
+        return cfg
+    from . import service
+
+    with contextlib.suppress(Exception):
+        if service.replay_build_is_saved_locally(cfg, replay):
+            return cfg
+    _steam_login_cli(cfg)
+    return _load(config_path)  # reload so the freshly cached login is picked up
+
+
 @app.command()
 def watch(
     replay: ReplayArg,
@@ -43,8 +111,9 @@ def watch(
     """Reconstruct the matching build and play REPLAY."""
     from . import service
 
+    cfg = _ensure_steam_login(_load(config_path), replay, config_path)
     try:
-        service.watch_replay(_load(config_path), replay, no_launch=no_launch)
+        service.watch_replay(cfg, replay, no_launch=no_launch)
     except _EXPECTED_ERRORS as exc:
         _fail(str(exc))
 
@@ -54,8 +123,9 @@ def add(replay: ReplayArg, config_path: ConfigOpt = None) -> None:
     """Download and store the build for REPLAY without launching."""
     from . import service
 
+    cfg = _ensure_steam_login(_load(config_path), replay, config_path)
     try:
-        build = service.add_build(_load(config_path), replay)
+        build = service.add_build(cfg, replay)
     except _EXPECTED_ERRORS as exc:
         _fail(str(exc))
     typer.echo(f"Stored build {build.build_id}.")
@@ -175,6 +245,17 @@ def update(
     manager.download_updates(info)
     typer.echo("Applying update and restarting...")
     manager.apply_updates_and_restart(info)
+
+
+@app.command()
+def login(config_path: ConfigOpt = None) -> None:
+    """Sign in to Steam (QR) and cache the login for future downloads."""
+    cfg = _load(config_path)
+    if cfg.steam_username:
+        typer.echo(f"Already signed in as {cfg.steam_username}.")
+        typer.echo("Remove the [steam] username from config.local.toml to sign in again.")
+        return
+    _steam_login_cli(cfg)
 
 
 @app.command()

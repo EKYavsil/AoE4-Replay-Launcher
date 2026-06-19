@@ -1274,16 +1274,21 @@ class Panel(ctk.CTk):
 
     # ---- profile resolution (id directly, or pick from name suggestions) ---
 
-    def _suggest(self, query, frame, status, target_entry, after_pick) -> None:
+    def _suggest(self, query, frame, status, target_entry, after_pick, on_ready=None) -> None:
         """Show name-search suggestions inline in ``frame``; picking one fills
-        ``target_entry`` with the chosen id and (optionally) runs ``after_pick``."""
+        ``target_entry`` with the chosen id and (optionally) runs ``after_pick``.
+        ``on_ready`` (if given) fires once fetching stops — the list is shown, or
+        the search ended with an error / no results — so the Search button can be
+        re-enabled without leaving a window for an overlapping search."""
         if len(query) < 2:
             self._info("Invalid", "Enter a profile ID, or a name (2+ characters).")
+            if on_ready is not None:
+                on_ready()
             return
         for child in frame.winfo_children():
             child.destroy()
         status.configure(text=f"Searching '{query}'…")
-        args = (query, frame, status, target_entry, after_pick)
+        args = (query, frame, status, target_entry, after_pick, on_ready)
         threading.Thread(target=self._suggest_worker, args=args, daemon=True).start()
 
     @staticmethod
@@ -1294,34 +1299,47 @@ class Panel(ctk.CTk):
         return "Something went wrong contacting aoe4world."
 
     def _h2h_failed(self, message: str) -> None:
-        self._searching = False
-        self.search_btn.configure(state="normal")
+        self._set_h2h_busy(False)
         self.status.configure(text=message)
 
     def _profile_failed(self, message: str) -> None:
-        self._pg_searching = False
-        self.p_search_btn.configure(state="normal")
+        self._set_profile_busy(False)
         with contextlib.suppress(Exception):
             self.load_more_btn.configure(state="normal")
         self.p_status.configure(text=message)
 
-    def _suggest_worker(self, query, frame, status, target_entry, after_pick) -> None:
+    def _suggest_worker(
+        self, query, frame, status, target_entry, after_pick, on_ready=None
+    ) -> None:
         try:
             players = aoe4world.search_players(query)
         except Exception as exc:  # noqa: BLE001 - never leave the suggestion box hung
             msg = self._api_error_text(exc)
-            self.after(0, lambda: status.configure(text=msg))
+
+            def fail() -> None:
+                status.configure(text=msg)
+                if on_ready is not None:
+                    on_ready()
+
+            self.after(0, fail)
             return
         self._load_country_flags(players)
 
         def render() -> None:
-            self._render_suggestions(players, query, frame, status, target_entry, after_pick)
+            self._render_suggestions(
+                players, query, frame, status, target_entry, after_pick, on_ready
+            )
 
         self.after(0, render)
 
-    def _render_suggestions(self, players, query, frame, status, target_entry, after_pick) -> None:
+    def _render_suggestions(
+        self, players, query, frame, status, target_entry, after_pick, on_ready=None
+    ) -> None:
         for child in frame.winfo_children():
             child.destroy()
+        self.after(0, lambda: self._scroll_to_top(frame))
+        if on_ready is not None:
+            on_ready()  # waiting for the user now -> a fresh search is allowed
         if not players:
             status.configure(text=f"No profile named '{query}'.")
             return
@@ -1391,14 +1409,31 @@ class Panel(ctk.CTk):
             return ("id", int(value))
         return ("name", value)
 
+    def _set_h2h_busy(self, busy: bool) -> None:
+        """Disable the head-to-head Search button while a request is running, so a
+        second search can't overlap and let a stale result open over a newer one.
+        The button is left enabled while waiting for the user to pick a profile."""
+        self._searching = busy
+        self.search_btn.configure(state="disabled" if busy else "normal")
+
+    def _set_profile_busy(self, busy: bool) -> None:
+        """Same, for the player-games (profile) tab's Search button."""
+        self._pg_searching = busy
+        self.p_search_btn.configure(state="disabled" if busy else "normal")
+
+    def _scroll_to_top(self, scroll_frame) -> None:
+        """Jump a CTkScrollableFrame back to the top, so a fresh result set isn't
+        left scrolled where a previous load-more'd list ended."""
+        with contextlib.suppress(Exception):
+            scroll_frame._parent_canvas.yview_moveto(0.0)
+
     def on_search(self) -> None:
         if self._searching:
             return
         v1 = self.entry1.get().strip()
         v2 = self.entry2.get().strip()
         self._drop_h2h_filter()  # a fresh search isn't bound by an old date range
-        self._searching = True
-        self.search_btn.configure(state="disabled")
+        self._set_h2h_busy(True)
         self.status.configure(text="Resolving…")
         threading.Thread(target=self._h2h_resolve, args=(v1, v2), daemon=True).start()
 
@@ -1420,24 +1455,43 @@ class Panel(ctk.CTk):
         self.after(0, lambda: self._h2h_after_resolve(r1, r2))
 
     def _h2h_after_resolve(self, r1: tuple, r2: tuple) -> None:
-        self._searching = False
-        self.search_btn.configure(state="normal")
+        # Stay busy (Search disabled) through the name-suggestion fetch; the button
+        # re-enables only once the list is shown (waiting for a pick) or at a
+        # terminal state, so a second search can't overlap and clobber the results.
+        # One Search click chains the whole flow: pick field 1 (if it's a name),
+        # then field 2 (if a name), then list the matches automatically.
         if r1[0] == "name":  # field 1 is a name (or numeric non-profile) -> pick one
-            self._suggest(r1[1], self.matches, self.status, self.entry1, after_pick=None)
+            self._suggest(
+                r1[1], self.matches, self.status, self.entry1,
+                after_pick=lambda pid: self._h2h_pick2(pid, r2),
+                on_ready=lambda: self._set_h2h_busy(False),
+            )
             return
+        self._h2h_pick2(r1[1], r2)
+
+    def _h2h_pick2(self, id1: int, r2: tuple) -> None:
+        """Field 1 is resolved to ``id1``; now resolve field 2 (pick one if it's a
+        name) and then list the head-to-head matches."""
         if r2[0] == "name":
-            self._suggest(r2[1], self.matches, self.status, self.entry2, after_pick=None)
+            self._set_h2h_busy(True)  # disable again during the field-2 fetch
+            self._suggest(
+                r2[1], self.matches, self.status, self.entry2,
+                after_pick=lambda pid: self._h2h_begin(id1, pid),
+                on_ready=lambda: self._set_h2h_busy(False),
+            )
             return
-        id1, id2 = r1[1], r2[1]
+        self._h2h_begin(id1, r2[1])
+
+    def _h2h_begin(self, id1: int, id2: int) -> None:
         if id1 == id2:
+            self._set_h2h_busy(False)
             self._info("Invalid", "Enter two different profiles.")
             return
         self._start_h2h(id1, id2)
 
     def _start_h2h(self, id1: int, id2: int) -> None:
         self._h2h_ids = (id1, id2)
-        self._searching = True
-        self.search_btn.configure(state="disabled")
+        self._set_h2h_busy(True)
         for child in self.matches.winfo_children():
             child.destroy()
         self.status.configure(text="Searching…")
@@ -1466,8 +1520,7 @@ class Panel(ctk.CTk):
         self.after(0, lambda: self._show_matches(summaries))
 
     def _show_matches(self, summaries: list[dict]) -> None:
-        self._searching = False
-        self.search_btn.configure(state="normal")
+        self._set_h2h_busy(False)
         self.status.configure(
             text=f"{len(summaries)} match(es)." if summaries else "No matches found."
         )
@@ -1475,6 +1528,7 @@ class Panel(ctk.CTk):
             self._game_card(self.matches, summary)
         # the date filter becomes available once matches are listed
         self.h_filter_box.pack(side="left", padx=(0, 6), pady=4)
+        self.after(0, lambda: self._scroll_to_top(self.matches))
 
     # ---- date-range filter (calendar) -------------------------------------
 
@@ -1567,8 +1621,7 @@ class Panel(ctk.CTk):
             return
         value = self.p_entry.get().strip()
         self._drop_profile_filter()  # a fresh search isn't bound by an old date range
-        self._pg_searching = True
-        self.p_search_btn.configure(state="disabled")
+        self._set_profile_busy(True)
         self.p_status.configure(text="Resolving…")
         threading.Thread(target=self._profile_resolve, args=(value,), daemon=True).start()
 
@@ -1590,15 +1643,16 @@ class Panel(ctk.CTk):
         self.after(0, lambda: self._profile_after_resolve(kind, resolved))
 
     def _profile_after_resolve(self, kind: str, resolved: object) -> None:
-        self._pg_searching = False
-        self.p_search_btn.configure(state="normal")
         if kind == "id":
             self._start_profile(resolved)
             return
-        # a name (or a numeric non-profile) -> pick one inline, then list its games
+        # a name (or a numeric non-profile) -> pick one inline (Search re-enables
+        # once the list is shown), then list its games.
         self.load_more_btn.pack_forget()
         self._suggest(
-            resolved, self.games, self.p_status, self.p_entry, after_pick=self._start_profile
+            resolved, self.games, self.p_status, self.p_entry,
+            after_pick=self._start_profile,
+            on_ready=lambda: self._set_profile_busy(False),
         )
 
     def _start_profile(self, pid: int) -> None:
@@ -1613,8 +1667,7 @@ class Panel(ctk.CTk):
         self.load_more_btn.pack_forget()
         # the date filter becomes available once a player is selected
         self.p_filter_box.pack(side="left", padx=(0, 6), pady=4, before=self.p_status)
-        self._pg_searching = True
-        self.p_search_btn.configure(state="disabled")
+        self._set_profile_busy(True)
         self.p_status.configure(text="Loading…")
         threading.Thread(target=self._profile_begin, args=(pid,), daemon=True).start()
 
@@ -1691,6 +1744,8 @@ class Panel(ctk.CTk):
         for summary in summaries:
             self._game_card(self.games, summary)
         self._pg_loaded += len(summaries)
+        if not append:  # a fresh search -> show it from the top, not where load-more left off
+            self.after(0, lambda: self._scroll_to_top(self.games))
         if self._pg_until:  # date-range filter active
             text = f"{self._pg_loaded} in range" if self._pg_loaded else "No games in range."
         else:

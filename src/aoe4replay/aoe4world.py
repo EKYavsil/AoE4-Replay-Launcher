@@ -517,8 +517,8 @@ def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
                 continue
             if exc.code == 429:  # rate limited — stop now, don't try more perspectives
                 raise RuntimeError(
-                    "aoe4world is rate-limiting replay downloads (HTTP 429). "
-                    "Wait a minute and try again."
+                    "The Age of Empires replay server is rate-limiting replay "
+                    "downloads (HTTP 429). Wait a minute and try again."
                 ) from exc
             error = exc  # 5xx etc. — a real error, but a sibling id may still work
             continue

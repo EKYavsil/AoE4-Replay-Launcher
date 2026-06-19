@@ -62,6 +62,42 @@ def matrix_to_ascii(matrix: list[list[bool]]) -> str:
     return "\n".join("".join("##" if d else "  " for d in row) for row in matrix)
 
 
+def matrix_to_terminal(matrix: list[list[bool]], quiet: int = 4) -> str:
+    """Render the matrix as a scannable QR for an ANSI terminal.
+
+    Two module rows are packed into one text row with the upper-half-block glyph
+    (``▀``), and every module's colour is set explicitly (dark = black, light =
+    white) via ANSI fg/bg, so the code is always dark-on-light regardless of the
+    terminal's own theme, square, and compact enough to scan with a phone. A
+    light quiet zone is added around it. ``""`` if the matrix is empty.
+    """
+    if not matrix:
+        return ""
+    width = max(len(r) for r in matrix)
+    total_w = width + 2 * quiet
+
+    def _pad(row: list[bool]) -> list[bool]:
+        body = [bool(c) for c in row] + [False] * (width - len(row))
+        return [False] * quiet + body + [False] * quiet
+
+    blank = [False] * total_w
+    grid = [list(blank) for _ in range(quiet)] + [_pad(r) for r in matrix]
+    grid += [list(blank) for _ in range(quiet)]
+    if len(grid) % 2:
+        grid.append(list(blank))
+
+    lines: list[str] = []
+    for r in range(0, len(grid), 2):
+        top, bot = grid[r], grid[r + 1]
+        cells = []
+        for x in range(total_w):
+            fg = 30 if top[x] else 97  # dark module -> black, light -> white
+            bg = 40 if bot[x] else 107
+            cells.append(f"\x1b[{fg};{bg}m▀")
+        lines.append("".join(cells) + "\x1b[0m")
+    return "\n".join(lines)
+
+
 def render_image(matrix: list[list[bool]], scale: int = 8):
     """Rasterise the (quiet-zone-inclusive) matrix into a crisp PIL image."""
     from PIL import Image
