@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aoe4-replay-launcher"
-version = "1.1.0"
+version = "1.1.4"
 description = "Watch old Age of Empires IV replays by reconstructing the exact game build they were recorded on, with content-defined deduplication of build assets."
 readme = "README.md"
 requires-python = ">=3.12"

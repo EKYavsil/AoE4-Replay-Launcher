@@ -118,8 +118,9 @@ The panel can:
    page to view previous versions and release notes.
 2. Extract the **entire folder** to a writable location such as your Desktop.
    Do not run it from inside the archive or place it under `Program Files`.
-3. Double-click **`AoE4 Replay Launcher.exe`** (in the main folder — not the
-   `AoE4ReplayLauncher-core.exe` inside the `current` subfolder).
+3. Double-click **`AoE4 Replay Launcher.exe`** in the main folder. (An
+   identically named copy lives in the `current` subfolder — that's the engine,
+   launched automatically; you don't run it directly.)
 
 Keep the extracted folder together. The application stores its configuration,
 downloaded tools, replay data, and restic repository inside this folder, and it

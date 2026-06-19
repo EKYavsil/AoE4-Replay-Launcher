@@ -63,7 +63,7 @@
       </div>
       <div>
         <span class="status-label">Latest release</span>
-        <strong id="latest-release">v1.1.0</strong>
+        <strong id="latest-release">v1.1.4</strong>
       </div>
     </section>
 
@@ -276,7 +276,7 @@ launch on the replay's original date</code></pre>
     //  - upgrade the download buttons to a one-click direct download when the
     //    portable asset exists; otherwise they keep pointing at the release page
     //    (the safe default already in their href), so they never 404.
-    fetch("https://api.github.com/repos/EKYavsil/AoE4-Replay-Launcher/releases/latest")
+    fetch("https://api.github.com/repos/EKYavsil/AoE4-Replay-Launcher/releases/latest", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         if (!d) return;
