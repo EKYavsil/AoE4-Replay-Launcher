@@ -65,8 +65,10 @@ jobs:
       - name: Build the onedir bundle with PyInstaller
         run: pyinstaller packaging/AoE4-Replay-Launcher.spec --noconfirm
 
-      - name: Stage README / license notices into the package
-        run: cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/AoE4-Replay-Launcher/"
+      # README / LICENSE / THIRD_PARTY_NOTICES are deliberately NOT copied into the
+      # package dir (they would land inside current/ and get replaced on every
+      # update). They are added to the portable bundle's *root* after packing, so
+      # they sit next to the exe the user runs and survive auto-updates.
 
       # --- CODE SIGNING (SignPath) ------------------------------------------
       # Once the SignPath OSS application is approved, sign the built files HERE,
@@ -101,6 +103,9 @@ jobs:
       - name: Rename the portable bundle to the canonical download name
         run: mv dist/Releases/*-Portable.zip "dist/Releases/AoE4ReplayLauncher.zip"
 
+      - name: Add README / license notices to the portable bundle root
+        run: 7z a -tzip "dist/Releases/AoE4ReplayLauncher.zip" README.md LICENSE THIRD_PARTY_NOTICES.md
+
       - name: Publish the GitHub release
         if: github.event_name == 'push' || inputs.publish
         env:
@@ -111,8 +116,12 @@ jobs:
           writable location (e.g. your Desktop), and run **AoE4 Replay Launcher.exe**.
           The launcher updates itself automatically when new versions are released.
           EOF
+          # Replace any existing release for this version so re-runs are clean (the
+          # tag is kept; only the release + its assets are recreated).
+          gh release delete "v${{ steps.ver.outputs.version }}" --yes || true
           gh release create "v${{ steps.ver.outputs.version }}" dist/Releases/* \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
             --title "v${{ steps.ver.outputs.version }}" \
             --notes-file notes.md
 
