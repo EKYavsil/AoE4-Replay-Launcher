@@ -36,13 +36,12 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
-# --- exe build / release artifacts (uploaded as a GitHub release asset, never committed) ---
-# The PyInstaller onedir output, the packaged zip, the build work dir (build/ above),
-# the exe (*.exe above), and the entire packaging/ folder (the .spec, entry script,
-# icon generator, and the generated app.ico) — nothing about building the exe is tracked.
+# --- exe build / release artifacts (generated build outputs; never committed) ---
+# The PyInstaller onedir output (/dist/), the build work dir (build/ above) and the
+# packaged zip are all generated. The build *inputs* under packaging/ (the .spec, the
+# entry script, and app.ico) ARE tracked so GitHub Actions can reproduce the release.
 /dist/
 *.zip
-/packaging/
 
 # --- editors / OS ---
 .vscode/

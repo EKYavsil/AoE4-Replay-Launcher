@@ -1,0 +1,124 @@
+name: Build and release
+
+# Builds the packaged launcher (PyInstaller onedir) and publishes a Velopack
+# release on GitHub. Running the build in CI — not on a developer machine — is
+# what lets SignPath (and others) verify the binary's origin once code signing
+# is wired in; see the "CODE SIGNING" step below.
+#
+# Trigger it either by pushing a tag like `v1.2.0`, or manually from the Actions
+# tab (Run workflow). The version always comes from pyproject.toml, so bump that
+# (and src/aoe4replay/__init__.py) together with the tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release (uncheck to only build artifacts)"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      REPO_URL: https://github.com/EKYavsil/AoE4-Replay-Launcher
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version from pyproject.toml
+        id: ver
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pyinstaller==6.21.0"
+          pip install .
+          # Keep the bundled Velopack runtime in lockstep with the vpk CLI below.
+          pip install "velopack==1.2.0"
+
+      - name: Install Velopack CLI (vpk)
+        run: |
+          dotnet tool install -g vpk --version 1.2.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Build the onedir bundle with PyInstaller
+        run: pyinstaller packaging/AoE4-Replay-Launcher.spec --noconfirm
+
+      - name: Stage README / license notices into the package
+        run: cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/AoE4-Replay-Launcher/"
+
+      # --- CODE SIGNING (SignPath) ------------------------------------------
+      # Once the SignPath OSS application is approved, sign the built files HERE,
+      # before `vpk pack`, so the exe the user runs is trusted by SmartScreen.
+      # Typical flow:
+      #   1. actions/upload-artifact the dist/AoE4-Replay-Launcher folder
+      #   2. signpath/github-action-submit-signing-request@v1 with the SignPath
+      #      org id / project slug / signing-policy slug (SIGNPATH_API_TOKEN secret)
+      #   3. download the signed files back over dist/AoE4-Replay-Launcher
+      # vpk also generates a stub + Update.exe; sign those via vpk's --signTemplate
+      # or a follow-up signing pass. Until then the release ships unsigned.
+      # ----------------------------------------------------------------------
+
+      - name: Fetch prior releases (delta base + feed continuity)
+        run: |
+          vpk download github --repoUrl "$REPO_URL" --token "${{ github.token }}" -o dist/Releases \
+            || echo "No prior releases found; building a full-only release."
+
+      - name: Pack the Velopack release
+        run: |
+          vpk pack \
+            -u AoE4ReplayLauncher \
+            -v "${{ steps.ver.outputs.version }}" \
+            -p dist/AoE4-Replay-Launcher \
+            -e "AoE4 Replay Launcher.exe" \
+            --packTitle "AoE4 Replay Launcher" \
+            --packAuthors "EKYavsil" \
+            -i packaging/app.ico \
+            -o dist/Releases \
+            --noInst
+
+      - name: Rename the portable bundle to the canonical download name
+        run: mv dist/Releases/*-Portable.zip "dist/Releases/AoE4ReplayLauncher.zip"
+
+      - name: Publish the GitHub release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          Download **AoE4ReplayLauncher.zip**, extract the entire folder to a
+          writable location (e.g. your Desktop), and run **AoE4 Replay Launcher.exe**.
+          The launcher updates itself automatically when new versions are released.
+          EOF
+          gh release create "v${{ steps.ver.outputs.version }}" dist/Releases/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "v${{ steps.ver.outputs.version }}" \
+            --notes-file notes.md
+
+      - name: Upload build artifacts (always, for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.ver.outputs.version }}
+          path: dist/Releases/*
+          if-no-files-found: error

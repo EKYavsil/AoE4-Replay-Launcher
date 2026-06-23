@@ -24,6 +24,12 @@ from .config import Config
 _EXE_CANDIDATES = ("RelicCardinal.exe", "AoE4.exe")
 _GAME_IMAGE = "RelicCardinal.exe"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console pop-ups under pythonw
+# Steam clears its "in-game" state a few seconds after the process exits (measured
+# ~10s for a steam_appid.txt launch). We wait this long before re-enabling Play so a
+# new launch never collides with Steam's stale state. A fixed wait — deliberately not
+# the Steam registry keys — keeps the binary off antivirus heuristics that flag a
+# downloader-style exe for polling HKCU\Software\Valve\Steam right after spawning a child.
+_STEAM_SETTLE_SECONDS = 15
 
 
 class _FixedFileInfo(ctypes.Structure):
@@ -207,45 +213,16 @@ def _wait_for_game_exit(image: str, appear_timeout: int = 180) -> None:
         time.sleep(2)
 
 
-def _steam_reports_game_running(cfg: Config) -> bool:
-    """Whether Steam still considers ``cfg.app_id`` to be running.
+def _wait_for_steam_idle(cfg: Config) -> None:
+    """After the game exits, give Steam time to clear its "in-game" state.
 
-    For a steam_appid.txt launch, Steam's registry state lags the real process
-    exit (measured ~10s), so we poll it to keep the panel in sync. Reads the
-    global ``RunningAppID`` and the per-app ``Running`` flag; either one set means
-    Steam hasn't caught up yet. Any read failure means "not running" (so a missing
-    key never blocks the UI).
+    Steam keeps reporting the app as running for several seconds after the process
+    is gone; launching a new replay into that gap collides with the stale state
+    (long hang, tiny window, etc.). We wait a fixed interval rather than reading
+    Steam's registry keys, so the panel re-enables Play only once Steam is free
+    without the binary doing registry recon that trips antivirus heuristics.
     """
-    import winreg
-
-    app = int(cfg.app_id)
-    with contextlib.suppress(OSError, ValueError):
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-            if int(winreg.QueryValueEx(key, "RunningAppID")[0]) == app:
-                return True
-    with contextlib.suppress(OSError, ValueError):
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, rf"Software\Valve\Steam\Apps\{app}"
-        ) as key:
-            if int(winreg.QueryValueEx(key, "Running")[0]) != 0:
-                return True
-    return False
-
-
-def _wait_for_steam_idle(cfg: Config, timeout: int = 30) -> None:
-    """After the game exits, wait until Steam also stops reporting it as running.
-
-    Steam clears its "in-game" state several seconds after the process is gone; if
-    a new replay is launched during that gap, the launch collides with Steam's
-    stale state (long hang, tiny window, etc.). Waiting here means the panel only
-    re-enables Play once Steam is actually free. Capped so a *stuck* Steam state
-    (it occasionally never clears) can never lock the Play button forever.
-    """
-    for _ in range(timeout):
-        if not _steam_reports_game_running(cfg):
-            return
-        time.sleep(1)
-    print("Steam still reports the game as running after waiting; continuing anyway.")
+    time.sleep(_STEAM_SETTLE_SECONDS)
 
 
 def launch_replay(
