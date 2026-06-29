@@ -179,7 +179,11 @@ def _localconfig_path() -> Path:
 # --- wrapper runtime paths ----------------------------------------------------
 
 def _steam_wrapper_root(cfg: Config) -> Path:
-    return cfg.project_root / "launch_work" / "steam_wrapper"
+    # A stable location OUTSIDE the (deletable) app folder, so the shim and its
+    # config survive even if the user deletes the launcher — keeping normal Play
+    # working. Independent of the portable app's RootAppDir.
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "AoE4ReplayLauncher" / "steam_wrapper"
 
 
 def _steam_wrapper_dispatch_config(cfg: Config) -> Path:
@@ -364,22 +368,74 @@ def _quote_arg(path: Path | str) -> str:
     return '"' + text.replace('"', '\\"') + '"'
 
 
-def _wrapper_dispatch_invocation(config_path: Path) -> str:
+def _dispatcher_prefix(config_path: Path) -> str:
+    """The launcher's dispatch invocation, minus the trailing ``%command%``.
+
+    This is what actually runs the dispatcher (the frozen exe, or the dev module).
+    The shim prepends it to Steam's command when the launcher is present.
+    """
     if getattr(sys, "frozen", False):
         exe = _quote_arg(Path(sys.executable))
-        return f"{exe} --steam-wrapper-dispatch {_quote_arg(config_path)} %command%"
+        return f"{exe} --steam-wrapper-dispatch {_quote_arg(config_path)}"
     python = Path(sys.executable).with_name("pythonw.exe")
     if not python.is_file():
         python = Path(sys.executable)
-    return (
-        f'{_quote_arg(python)} -m aoe4replay.steamwrap '
-        f'--dispatch {_quote_arg(config_path)} %command%'
-    )
+    return f"{_quote_arg(python)} -m aoe4replay.steamwrap --dispatch {_quote_arg(config_path)}"
+
+
+def _bundled_shim_path() -> Path | None:
+    """The steamshim.exe shipped with the build (frozen bundle, or source tree)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / "steamshim.exe"
+        return candidate if candidate.is_file() else None
+    candidate = Path(__file__).resolve().parents[2] / "packaging" / "steamshim.exe"
+    return candidate if candidate.is_file() else None
+
+
+def _shim_exe_path(cfg: Config) -> Path:
+    return _steam_wrapper_root(cfg) / "steamshim.exe"
+
+
+def _deploy_shim(cfg: Config) -> Path | None:
+    """Copy the shim into the stable %LocalAppData% dir; return its path, or None.
+
+    Only used for packaged (frozen) builds — that's where surviving an app-folder
+    deletion matters. Source/dev runs use the direct dispatcher invocation.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    src = _bundled_shim_path()
+    if src is None:
+        return None
+    dst = _shim_exe_path(cfg)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+            shutil.copyfile(src, dst)
+    except OSError:
+        return None
+    return dst
+
+
+def _write_shim_cfg(cfg: Config, check_path: str, prefix: str) -> None:
+    """Write the shim config: line 1 = existence check, line 2 = dispatcher prefix.
+
+    UTF-16LE so non-ASCII paths (e.g. localized user folders) round-trip; the shim
+    reads it back as wide chars.
+    """
+    path = _steam_wrapper_root(cfg) / "shim.cfg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(f"{check_path}\n{prefix}\n", encoding="utf-16-le")
+    os.replace(tmp, path)
 
 
 def _is_dispatch_launch_options(value: str) -> bool:
-    return "--steam-wrapper-dispatch" in value or (
-        "aoe4replay.steamwrap" in value and "--dispatch" in value
+    return (
+        "--steam-wrapper-dispatch" in value
+        or ("aoe4replay.steamwrap" in value and "--dispatch" in value)
+        or "steamshim.exe" in value.lower()
     )
 
 
@@ -479,7 +535,16 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
         raise FileNotFoundError(f"Steam localconfig.vdf was not found: {localconfig}")
 
     dispatch_config = _steam_wrapper_dispatch_config(cfg)
-    desired = _wrapper_dispatch_invocation(dispatch_config)
+    prefix = _dispatcher_prefix(dispatch_config)
+    shim = _deploy_shim(cfg)
+    if shim is not None:
+        # LaunchOptions points at the stable shim: it forwards to the launcher when
+        # present, or passes Steam's command straight through if the app was deleted
+        # (so normal Play never breaks). check_path is the launcher exe itself.
+        _write_shim_cfg(cfg, str(Path(sys.executable)), prefix)
+        desired = f"{_quote_arg(shim)} %command%"
+    else:
+        desired = f"{prefix} %command%"
     current = _get_launch_options(localconfig, cfg.app_id)
     existing = _read_dispatch_config(cfg)
     if _is_replay_wrapper_launch_options(current):
