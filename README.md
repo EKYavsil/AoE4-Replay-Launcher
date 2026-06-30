@@ -56,7 +56,7 @@ launcher updates itself automatically when new versions are released.
                         + restored historical delta (hardlinked)
        │
        ▼
-   launch through RunAsDate using the replay's date
+   launch through Steam (a real game session) using the replay's date (RunAsDate)
 ```
 
 The restic repository stores only the files that differ from the current live
@@ -78,6 +78,26 @@ Does not require re-downloading.
 A scheduled job records newly released Steam manifests, and the launcher
 refreshes its build map at startup. Newly released patches can therefore be
 supported without requiring a new application release.
+
+## Launching through Steam
+
+Age of Empires IV must be started **by Steam** to receive a full game session.
+A build launched as a plain process gets a degraded session and crashes part-way
+through longer replays, so the launcher routes playback through Steam itself.
+
+To do this, it installs a small, persistent **Launch Options wrapper** on the
+game in Steam (applied with a one-time Steam restart). When you watch an old
+replay, the launcher asks Steam to start the game; Steam runs the wrapper, which
+then starts the reconstructed historical build—through RunAsDate for the replay's
+date—inside a real Steam session. Replays on your current build are launched the
+same way, directly through Steam.
+
+The wrapper points at a tiny native helper, **`steamshim.exe`**, kept in your
+`%LocalAppData%` folder rather than inside the launcher folder. This keeps normal
+Steam **Play** working no matter what: when no replay is requested—or even if you
+move or delete the launcher—the helper simply passes Steam's normal launch
+through to the game unchanged. Any custom Steam launch options you already had are
+preserved and reapplied.
 
 ## Steam sign-in and privacy
 
@@ -108,6 +128,11 @@ The panel can:
 - import existing `.rec` and `.gz` files;
 - play or delete downloaded replays;
 - manage saved historical builds and display their disk usage.
+
+> **Custom game replays** are intentionally not listed—the launcher finds ranked
+> and automatch games through the official Relic API, which does not index custom
+> games. If you obtain a custom game some other way, you can still import
+> it and the launcher will reconstruct its build and play it like any other replay.
 
 ## Getting started
 

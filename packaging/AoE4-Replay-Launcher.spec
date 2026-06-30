@@ -38,6 +38,10 @@ datas += [
     (os.path.join(ROOT, "config.example.toml"), "seed_data"),
     (os.path.join(ROOT, "data", "aoe4-build-map.json"), "seed_data"),
     (os.path.join(ROOT, "data", "aoe4-manifest-history.json"), "seed_data"),
+    # Native Steam launch shim (compiled separately to packaging/steamshim.exe).
+    # Bundled at the root so it lands in _internal/ (sys._MEIPASS) for deployment
+    # to %LocalAppData% on first wrapper install.
+    (os.path.join(ROOT, "packaging", "steamshim.exe"), "."),
 ]
 
 binaries = []

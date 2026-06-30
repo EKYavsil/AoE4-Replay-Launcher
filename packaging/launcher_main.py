@@ -13,6 +13,7 @@ immediately and we continue to the panel.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 
 def main() -> None:
@@ -22,6 +23,16 @@ def main() -> None:
         velopack.App().run()
     except ImportError:
         pass  # source/dev runs (and the legacy build) don't ship velopack
+
+    # When Steam launches AoE4 through our LaunchOptions wrapper, the exe runs in
+    # dispatch mode: start a pending reconstructed-build replay, or pass Steam's
+    # original %command% through so normal Play is unaffected.
+    if len(sys.argv) > 1 and sys.argv[1] == "--steam-wrapper-dispatch":
+        from aoe4replay import steamwrap
+
+        if len(sys.argv) < 3:
+            raise SystemExit("--steam-wrapper-dispatch requires a dispatch config path")
+        raise SystemExit(steamwrap.run_dispatch(Path(sys.argv[2]), sys.argv[3:]))
 
     from aoe4replay import config
 

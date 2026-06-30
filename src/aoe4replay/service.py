@@ -89,7 +89,7 @@ def _clean_stale_workdirs(cfg: Config) -> None:
     work = _launch_work(cfg)
     if not work.exists():
         return
-    keep = {"builds", "saved_builds.json", "saved_builds.json.tmp"}
+    keep = {"builds", "saved_builds.json", "saved_builds.json.tmp", "steam_wrapper"}
     for child in work.iterdir():
         if child.name in keep:
             continue
@@ -829,11 +829,9 @@ def watch_replay(
             print(f"Playback replay: {playback.path}")
             return
         try:
-            launch.launch_replay(
-                cfg, cfg.steam_install, playback.name,
-                stamp.value if stamp else datetime.now(),  # unused: current build, no RunAsDate
-                use_runasdate=False,
-            )
+            # Launch through Steam (not a direct spawn): a directly spawned game runs
+            # without a full Steam session and crashes mid-match on long replays.
+            launch.launch_replay_via_steam(cfg, playback.name)
         finally:
             if playback.delete_after_launch and playback.path.is_file():
                 playback.path.unlink()

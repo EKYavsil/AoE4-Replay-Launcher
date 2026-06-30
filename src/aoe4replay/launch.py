@@ -1,15 +1,21 @@
-"""Launching the reconstructed build and playing a replay.
+"""Launching Age of Empires IV replay builds.
 
-Ensures Steam is running, temporarily disables user mods, and starts the game
-through RunAsDate at the replay's timestamp so old builds skip date checks.
+Current replays use Steam's normal ``-applaunch`` path. Reconstructed old builds
+use a persistent Steam LaunchOptions wrapper so Steam still creates the official
+AoE4 app session (env/ticket) while the wrapper starts the cached historical
+executable. Old builds are still launched through RunAsDate so date-limited
+middleware licenses accept them.
 """
 
 from __future__ import annotations
 
 import contextlib
 import ctypes
+import json
+import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,11 +31,15 @@ _EXE_CANDIDATES = ("RelicCardinal.exe", "AoE4.exe")
 _GAME_IMAGE = "RelicCardinal.exe"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console pop-ups under pythonw
 # Steam clears its "in-game" state a few seconds after the process exits (measured
-# ~10s for a steam_appid.txt launch). We wait this long before re-enabling Play so a
-# new launch never collides with Steam's stale state. A fixed wait — deliberately not
+# ~10s for a Steam launch). We wait this long before re-enabling Play so a new
+# launch never collides with Steam's stale state. A fixed wait — deliberately not
 # the Steam registry keys — keeps the binary off antivirus heuristics that flag a
 # downloader-style exe for polling HKCU\Software\Valve\Steam right after spawning a child.
 _STEAM_SETTLE_SECONDS = 15
+# A one-shot active replay request is consumed within seconds of the steam
+# -applaunch that triggers the wrapper. Expire it quickly so a launcher that died
+# mid-launch can't make a later normal Play open the wrong (old) build.
+_REQUEST_TTL_SECONDS = 180
 
 
 class _FixedFileInfo(ctypes.Structure):
@@ -124,6 +134,530 @@ def ensure_steam_running(cfg: Config) -> None:
         return
     raise RuntimeError("Please open Steam and log into your account, then try again.")
 
+
+# --- Steam install / active user discovery (for the LaunchOptions wrapper) -----
+
+def _steam_root(cfg: Config | None = None) -> Path:
+    """Steam install root. Prefer the configured steam.exe's folder so every Steam
+    operation (shutdown, localconfig, start) targets the *same* client; fall back to
+    registry discovery when no override is set."""
+    if cfg is not None:
+        exe = getattr(cfg, "steam_exe", None)
+        if exe is not None:
+            root = Path(exe).parent
+            if root.is_dir():
+                return root
+    try:
+        import winreg
+
+        for hive, sub, name in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+        ):
+            try:
+                with winreg.OpenKey(hive, sub) as handle:
+                    value, _ = winreg.QueryValueEx(handle, name)
+            except OSError:
+                continue
+            path = Path(value)
+            if path.is_dir():
+                return path
+    except OSError:
+        pass
+    return Path(r"C:\Program Files (x86)\Steam")
+
+
+def _active_user_id() -> str:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\ActiveProcess"
+        ) as key:
+            active_user, _ = winreg.QueryValueEx(key, "ActiveUser")
+        user_id = str(int(active_user))
+        if user_id != "0":
+            return user_id
+    except (OSError, ValueError):
+        pass
+    raise RuntimeError("Please open Steam and log into your account, then try again.")
+
+
+def _localconfig_path(cfg: Config | None = None) -> Path:
+    return _steam_root(cfg) / "userdata" / _active_user_id() / "config" / "localconfig.vdf"
+
+
+# --- wrapper runtime paths ----------------------------------------------------
+
+def _steam_wrapper_root(cfg: Config) -> Path:
+    # A stable location OUTSIDE the (deletable) app folder, so the shim and its
+    # config survive even if the user deletes the launcher — keeping normal Play
+    # working. Independent of the portable app's RootAppDir.
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "AoE4ReplayLauncher" / "steam_wrapper"
+
+
+def _steam_wrapper_dispatch_config(cfg: Config) -> Path:
+    return _steam_wrapper_root(cfg) / "dispatch.json"
+
+
+def _steam_wrapper_request(cfg: Config) -> Path:
+    return _steam_wrapper_root(cfg) / "active_request.json"
+
+
+# --- one-time Steam restart (LaunchOptions are only read on Steam start) -------
+
+def _shutdown_steam(cfg: Config | None = None, timeout: int = 60) -> None:
+    steam = _steam_root(cfg) / "steam.exe"
+    if steam.is_file():
+        subprocess.run([str(steam), "-shutdown"], check=False, creationflags=_NO_WINDOW)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _process_running("steam.exe"):
+            return
+        time.sleep(1)
+    raise RuntimeError("Steam did not close in time. Close Steam manually and try again.")
+
+
+def _start_steam(cfg: Config) -> None:
+    if not cfg.steam_exe.is_file():
+        raise FileNotFoundError(f"steam.exe was not found: {cfg.steam_exe}")
+    subprocess.Popen([str(cfg.steam_exe)], creationflags=_NO_WINDOW)
+
+
+def _wait_for_steam_ready(timeout: int = 120) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _process_running("steam.exe") and _steam_logged_in():
+            return
+        time.sleep(1)
+    raise RuntimeError("Steam did not come back online in time. Open Steam and try again.")
+
+
+# --- minimal VDF parser/formatter for localconfig.vdf -------------------------
+
+def _tokenise_vdf(text: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "{}":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            i += 1
+            buf: list[str] = []
+            while i < n:
+                ch = text[i]
+                if ch == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if ch == '"':
+                    i += 1
+                    break
+                buf.append(ch)
+                i += 1
+            tokens.append("".join(buf))
+            continue
+        start = i
+        while i < n and not text[i].isspace() and text[i] not in "{}":
+            i += 1
+        tokens.append(text[start:i])
+    return tokens
+
+
+def _parse_vdf(text: str) -> tuple[str, dict]:
+    tokens = _tokenise_vdf(text)
+    pos = 0
+
+    def take() -> str:
+        nonlocal pos
+        if pos >= len(tokens):
+            raise ValueError("Unexpected end of VDF")
+        value = tokens[pos]
+        pos += 1
+        return value
+
+    def parse_obj() -> dict:
+        node: dict[str, str | dict] = {}
+        while pos < len(tokens):
+            key = take()
+            if key == "}":
+                return node
+            value = take()
+            if value == "{":
+                node[key] = parse_obj()
+            elif value == "}":
+                raise ValueError("Unexpected VDF block close")
+            else:
+                node[key] = value
+        return node
+
+    root = take()
+    if take() != "{":
+        raise ValueError("VDF root is not an object")
+    return root, parse_obj()
+
+
+def _quote_vdf(value: object) -> str:
+    text = str(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _format_vdf(root: str, node: dict) -> str:
+    lines = [_quote_vdf(root), "{"]
+
+    def emit(obj: dict, indent: int) -> None:
+        pad = "\t" * indent
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                lines.append(f"{pad}{_quote_vdf(key)}")
+                lines.append(f"{pad}{{")
+                emit(value, indent + 1)
+                lines.append(f"{pad}}}")
+            else:
+                lines.append(f"{pad}{_quote_vdf(key)}\t\t{_quote_vdf(value)}")
+
+    emit(node, 1)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _child(node: dict, key: str) -> dict:
+    value = node.get(key)
+    if not isinstance(value, dict):
+        value = {}
+        node[key] = value
+    return value
+
+
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 40, delay: float = 0.02) -> None:
+    """``os.replace``, retried on Windows' transient PermissionError when two
+    launcher instances race to replace the same %LocalAppData% file at once."""
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+def _write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp name: two launcher instances share %LocalAppData% and could write
+    # the same file at once. A fixed .tmp would let them clobber each other mid-write;
+    # per-writer temps keep os.replace atomic (last writer wins on the final file).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    _write_text_atomic(path, json.dumps(data, indent=2) + "\n")
+
+
+def _set_launch_options(localconfig: Path, app_id: str, launch_options: str) -> None:
+    root, data = _parse_vdf(localconfig.read_text(encoding="utf-8", errors="replace"))
+    apps = _child(_child(_child(data, "Software"), "Valve"), "Steam")
+    app = _child(_child(apps, "apps"), app_id)
+    app["LaunchOptions"] = launch_options
+    _write_text_atomic(localconfig, _format_vdf(root, data))
+
+
+def _get_launch_options(localconfig: Path, app_id: str) -> str:
+    _root, data = _parse_vdf(localconfig.read_text(encoding="utf-8", errors="replace"))
+    node: object = data
+    for key in ("Software", "Valve", "Steam", "apps", app_id):
+        if not isinstance(node, dict):
+            return ""
+        node = node.get(key)
+    if isinstance(node, dict):
+        value = node.get("LaunchOptions")
+        return str(value) if value is not None else ""
+    return ""
+
+
+# --- LaunchOptions invocation + sanitising ------------------------------------
+
+def _quote_arg(path: Path | str) -> str:
+    text = str(path)
+    return '"' + text.replace('"', '\\"') + '"'
+
+
+def _dispatcher_prefix(config_path: Path) -> str:
+    """The launcher's dispatch invocation, minus the trailing ``%command%``.
+
+    This is what actually runs the dispatcher (the frozen exe, or the dev module).
+    The shim prepends it to Steam's command when the launcher is present.
+    """
+    if getattr(sys, "frozen", False):
+        exe = _quote_arg(Path(sys.executable))
+        return f"{exe} --steam-wrapper-dispatch {_quote_arg(config_path)}"
+    python = Path(sys.executable).with_name("pythonw.exe")
+    if not python.is_file():
+        python = Path(sys.executable)
+    return f"{_quote_arg(python)} -m aoe4replay.steamwrap --dispatch {_quote_arg(config_path)}"
+
+
+def _bundled_shim_path() -> Path | None:
+    """The steamshim.exe shipped with the build (frozen bundle, or source tree)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / "steamshim.exe"
+        return candidate if candidate.is_file() else None
+    candidate = Path(__file__).resolve().parents[2] / "packaging" / "steamshim.exe"
+    return candidate if candidate.is_file() else None
+
+
+def _shim_exe_path(cfg: Config) -> Path:
+    return _steam_wrapper_root(cfg) / "steamshim.exe"
+
+
+def _deploy_shim(cfg: Config) -> Path | None:
+    """Copy the shim into the stable %LocalAppData% dir; return its path, or None.
+
+    Only used for packaged (frozen) builds — that's where surviving an app-folder
+    deletion matters. Source/dev runs use the direct dispatcher invocation.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    src = _bundled_shim_path()
+    if src is None:
+        return None
+    dst = _shim_exe_path(cfg)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+            shutil.copyfile(src, dst)
+    except OSError:
+        return None
+    return dst
+
+
+def _write_shim_cfg(cfg: Config, check_path: str, prefix: str) -> None:
+    """Write the shim config: line 1 = existence check, line 2 = dispatcher prefix.
+
+    UTF-16LE so non-ASCII paths (e.g. localized user folders) round-trip; the shim
+    reads it back as wide chars.
+    """
+    path = _steam_wrapper_root(cfg) / "shim.cfg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(f"{check_path}\n{prefix}\n", encoding="utf-16-le")
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def _is_dispatch_launch_options(value: str) -> bool:
+    return (
+        "--steam-wrapper-dispatch" in value
+        or ("aoe4replay.steamwrap" in value and "--dispatch" in value)
+        or "steamshim.exe" in value.lower()
+    )
+
+
+def _is_replay_wrapper_launch_options(value: str) -> bool:
+    return _is_dispatch_launch_options(value) or "--steam-wrapper" in value
+
+
+def _sanitize_original_launch_options(value: str) -> str:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if _is_replay_wrapper_launch_options(text):
+        return ""
+    if "-replay" in lowered and "playback:" in lowered:
+        return ""
+    return text
+
+
+# --- dispatch config + active replay request ----------------------------------
+
+def _read_dispatch_config(cfg: Config) -> dict:
+    path = _steam_wrapper_dispatch_config(cfg)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_dispatch_config(cfg: Config, original_launch_options: str) -> Path:
+    root = _steam_wrapper_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    path = _steam_wrapper_dispatch_config(cfg)
+    _write_json_atomic(
+        path,
+        {
+            "mode": "dispatch",
+            "app_id": cfg.app_id,
+            "request": str(_steam_wrapper_request(cfg)),
+            "log": str(root / "wrapper.log"),
+            "original_launch_options": original_launch_options,
+        },
+    )
+    return path
+
+
+def _write_active_replay_request(
+    cfg: Config,
+    launch_dir: Path,
+    exe: Path,
+    replay_name: str,
+    dev: bool,
+    runasdate_exe: Path | None = None,
+    runasdate_when: datetime | None = None,
+) -> Path:
+    root = _steam_wrapper_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    game_args = ["-replay", f"playback:{replay_name}"]
+    if dev:
+        game_args = ["-dev", *game_args]
+    path = _steam_wrapper_request(cfg)
+    now = time.time()
+    request: dict = {
+        "token": uuid.uuid4().hex,
+        "target": str(exe),
+        "cwd": str(launch_dir),
+        "app_id": cfg.app_id,
+        "game_args": game_args,
+        "log": str(root / "wrapper.log"),
+        "created_at": now,
+        "expires_at": now + _REQUEST_TTL_SECONDS,  # short TTL: no stale-request hijack
+    }
+    if runasdate_exe is not None and runasdate_when is not None:
+        # Same date/time format the launcher has always passed to RunAsDate.
+        request["runasdate"] = {
+            "exe": str(runasdate_exe),
+            "date": runasdate_when.strftime("%d/%m/%Y"),
+            "time": runasdate_when.strftime("%H:%M:%S"),
+        }
+    _write_json_atomic(path, request)
+    return path
+
+
+def _clear_active_replay_request(cfg: Config) -> None:
+    with contextlib.suppress(OSError):
+        _steam_wrapper_request(cfg).unlink()
+
+
+def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
+    """Install/update the persistent Steam LaunchOptions wrapper.
+
+    Returns True when Steam had to be restarted so the changed LaunchOptions are
+    loaded. Once installed, replay launches only write ``active_request.json`` and
+    call ``steam -applaunch``; no Steam restart is needed.
+    """
+    localconfig = _localconfig_path(cfg)
+    if not localconfig.is_file():
+        raise FileNotFoundError(f"Steam localconfig.vdf was not found: {localconfig}")
+
+    dispatch_config = _steam_wrapper_dispatch_config(cfg)
+    prefix = _dispatcher_prefix(dispatch_config)
+    shim = _deploy_shim(cfg)
+    if shim is not None:
+        # LaunchOptions points at the stable shim: it forwards to the launcher when
+        # present, or passes Steam's command straight through if the app was deleted
+        # (so normal Play never breaks). check_path is the launcher exe itself.
+        _write_shim_cfg(cfg, str(Path(sys.executable)), prefix)
+        desired = f"{_quote_arg(shim)} %command%"
+    else:
+        desired = f"{prefix} %command%"
+    current = _get_launch_options(localconfig, cfg.app_id)
+    existing = _read_dispatch_config(cfg)
+    if _is_replay_wrapper_launch_options(current):
+        original = _sanitize_original_launch_options(
+            str(existing.get("original_launch_options") or "")
+        )
+    else:
+        original = _sanitize_original_launch_options(current)
+
+    _write_dispatch_config(cfg, original)
+    if current == desired:
+        return False
+
+    print("Installing Steam replay wrapper integration (one-time Steam restart)...")
+    _shutdown_steam(cfg)
+    # Always bring Steam back, even if writing LaunchOptions fails — otherwise a
+    # failed write would leave Steam closed and the user stuck reopening it manually.
+    try:
+        _set_launch_options(localconfig, cfg.app_id, desired)
+    finally:
+        _start_steam(cfg)
+    _wait_for_steam_ready()
+    return True
+
+
+def wrapper_restart_pending(cfg: Config) -> bool:
+    """True if installing the replay wrapper would require the one-time Steam
+    restart (LaunchOptions don't yet point at our wrapper). Read-only, best-effort
+    — used to warn the user before an old-build replay triggers the restart. Mirrors
+    the ``current != desired`` decision in _ensure_steam_wrapper_integration.
+    """
+    try:
+        localconfig = _localconfig_path(cfg)
+        if not localconfig.is_file():
+            return False
+        current = _get_launch_options(localconfig, cfg.app_id)
+    except Exception:  # noqa: BLE001 - prediction must never block a launch
+        return False
+    if getattr(sys, "frozen", False) and _bundled_shim_path() is not None:
+        desired = f"{_quote_arg(_shim_exe_path(cfg))} %command%"
+    else:
+        desired = f"{_dispatcher_prefix(_steam_wrapper_dispatch_config(cfg))} %command%"
+    return current != desired
+
+
+def heal_wrapper_paths(cfg: Config) -> None:
+    """Refresh the shim's stored launcher path if the app was moved (or updated).
+
+    The shim lives in %LocalAppData% and survives a move; only the launcher path it
+    stores (shim.cfg) goes stale. When stale, normal Play still works (the shim
+    falls back to passing Steam's command through), and an old-build replay would
+    self-heal on launch — but refreshing here keeps the shim pointed at the live
+    launcher immediately. No Steam restart: LaunchOptions still points at the
+    (unmoved) shim. Best-effort, packaged builds only, and only when already set up.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    cfg_path = _steam_wrapper_root(cfg) / "shim.cfg"
+    if not cfg_path.is_file():
+        return
+    try:
+        text = cfg_path.read_text(encoding="utf-16-le")
+    except OSError:
+        return
+    stored_check = (text.lstrip("﻿").splitlines() or [""])[0]
+    current = str(Path(sys.executable))
+    if stored_check == current:
+        return  # already pointing at the live launcher
+    prefix = _dispatcher_prefix(_steam_wrapper_dispatch_config(cfg))
+    with contextlib.suppress(OSError):
+        _write_shim_cfg(cfg, current, prefix)
+        print("Refreshed Steam shim path after the launcher moved/updated.")
+
+
+# --- temporary user-mods handling (unchanged from the direct-launch design) ----
 
 @dataclass
 class ModsState:
@@ -225,53 +759,92 @@ def _wait_for_steam_idle(cfg: Config) -> None:
     time.sleep(_STEAM_SETTLE_SECONDS)
 
 
+def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = False) -> None:
+    """Launch a current-build replay *through Steam* (``steam -applaunch``).
+
+    The replay matches the installed build, so Steam launches the live install
+    directly with the ``-dev -replay`` arguments — giving the game a real Steam
+    session (which a direct spawn lacks, and which crashes mid-match on long
+    replays). The persistent wrapper, if installed, sees no active request and
+    passes this command straight through.
+    """
+    ensure_steam_running(cfg)
+    mods_state = None if keep_mods else disable_user_mods(cfg)
+    try:
+        # Drop any stale old-build request so the wrapper passes this current-build
+        # replay straight through instead of dispatching an old build.
+        _clear_active_replay_request(cfg)
+        args = [
+            str(cfg.steam_exe), "-applaunch", cfg.app_id,
+            "-dev", "-replay", f"playback:{replay_name}",
+        ]
+        print(f"Launching AOE4 through Steam: {' '.join(args)}")
+        subprocess.Popen(args)
+        # The game is a child of Steam, not us, so watch the image rather than wait()
+        # on our Popen (which is just the steam.exe forwarder and exits immediately).
+        _wait_for_game_exit(_GAME_IMAGE)
+        _wait_for_steam_idle(cfg)
+    finally:
+        restore_user_mods(mods_state)
+
+
 def launch_replay(
     cfg: Config,
     launch_dir: Path,
     replay_name: str,
-    when: datetime,
+    when: datetime | None = None,
     use_runasdate: bool = True,
     keep_mods: bool = False,
     dev: bool = True,
 ) -> None:
-    """Launch the game on the composed build and wait for it to exit."""
+    """Launch a reconstructed build through Steam's official AoE4 app session.
+
+    Steam can only ``-applaunch`` the *current* install, so instead of launching
+    the historical exe directly (which yields a broken Steam session and a
+    mid-match crash), we install a persistent Steam LaunchOptions wrapper. Before
+    each launch we write a one-shot ``active_request.json`` describing the
+    reconstructed exe (and, for old builds, the RunAsDate shim) and call
+    ``steam -applaunch``; the wrapper Steam starts then runs that exe with a real
+    Steam app session.
+    """
     launch_dir = Path(launch_dir)
     exe = find_executable(launch_dir)
-    (launch_dir / "steam_appid.txt").write_text(cfg.app_id, encoding="ascii")
-
-    game_args = ["-replay", f"playback:{replay_name}"]
-    if dev:
-        game_args = ["-dev", *game_args]
-
     ensure_steam_running(cfg)
     mods_state = None if keep_mods else disable_user_mods(cfg)
     try:
-        runasdate = None
-        if use_runasdate:
-            try:
-                runasdate = tools.ensure_runasdate(cfg)
-            except FileNotFoundError as exc:
-                print(f"{exc}\nFalling back to a direct launch; old builds may show date warnings.")
+        restarted = _ensure_steam_wrapper_integration(cfg)
 
-        if runasdate:
-            run_date = when.strftime("%d/%m/%Y")
-            run_time = when.strftime("%H:%M:%S")
-            args = [
-                str(runasdate), "/movetime", "/startin", str(launch_dir),
-                run_date, run_time, str(exe), *game_args,
-            ]
-            print(f"Starting AOE4 through RunAsDate at replay time: {when:%Y-%m-%d %H:%M:%S}")
-            subprocess.Popen(args, cwd=str(launch_dir))
-            # Watch the executable we actually launched, not a hard-coded name, so
-            # the watcher can't miss the game and let cleanup delete a running build.
-            _wait_for_game_exit(exe.name)
-        else:
-            print(f"Launching {exe.name} {' '.join(game_args)}")
-            proc = subprocess.Popen([str(exe), *game_args], cwd=str(launch_dir))
-            proc.wait()
-        # The game process is gone, but Steam's "running" state lags it by ~10s for
-        # a steam_appid.txt launch. Wait for Steam to catch up so the panel re-enables
-        # Play only once Steam is actually free — launching into the gap misbehaves.
+        runasdate_exe = None
+        if use_runasdate and when is not None:
+            try:
+                runasdate_exe = tools.ensure_runasdate(cfg)
+                print(f"Launching with RunAsDate shim: {when:%Y-%m-%d %H:%M:%S}")
+            except Exception as exc:  # noqa: BLE001 - date shim is best-effort
+                print(
+                    f"{exc}\nRunAsDate unavailable; launching without the date shim "
+                    "(old builds may show date warnings)."
+                )
+                runasdate_exe = None
+
+        _write_active_replay_request(
+            cfg,
+            launch_dir,
+            exe,
+            replay_name,
+            dev,
+            runasdate_exe=runasdate_exe,
+            runasdate_when=when if runasdate_exe is not None else None,
+        )
+        if restarted:
+            print("Steam replay wrapper is installed; future old replays will not restart Steam.")
+
+        args = [str(cfg.steam_exe), "-applaunch", cfg.app_id]
+        print(f"Launching reconstructed AOE4 build through Steam: {' '.join(args)}")
+        subprocess.Popen(args, creationflags=_NO_WINDOW)
+        _wait_for_game_exit(exe.name)
         _wait_for_steam_idle(cfg)
     finally:
-        restore_user_mods(mods_state)
+        try:
+            _clear_active_replay_request(cfg)
+        finally:
+            restore_user_mods(mods_state)
