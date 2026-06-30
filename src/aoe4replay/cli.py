@@ -109,13 +109,20 @@ def watch(
     no_launch: Annotated[bool, typer.Option("--no-launch", help="Do not launch")] = False,
 ) -> None:
     """Reconstruct the matching build and play REPLAY."""
-    from . import service
+    from . import buildcache, service
 
     cfg = _ensure_steam_login(_load(config_path), replay, config_path)
     try:
         service.watch_replay(cfg, replay, no_launch=no_launch)
     except _EXPECTED_ERRORS as exc:
         _fail(str(exc))
+    if not no_launch:
+        # The game has exited; drop the composed build (unsaved cache) like the panel
+        # does on close, so CLI use doesn't pile up build dirs. The restic delta stays,
+        # so a re-watch rebuilds locally with no re-download. Skipped for --no-launch,
+        # which exists to prepare a build on purpose.
+        with contextlib.suppress(Exception):
+            buildcache.cleanup(cfg)
 
 
 @app.command()

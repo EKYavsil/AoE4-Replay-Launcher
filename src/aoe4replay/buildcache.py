@@ -60,7 +60,10 @@ def load_saved(cfg: Config) -> set[str] | None:
     if not path.exists():
         return set()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig tolerates a stray BOM (e.g. a file touched by PowerShell): a BOM
+        # otherwise makes json.loads fail -> the list reads as "unreadable" -> cleanup
+        # refuses to run and unsaved builds pile up forever.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, list):

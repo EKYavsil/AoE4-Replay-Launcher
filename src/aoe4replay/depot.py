@@ -86,6 +86,20 @@ def _kill_on_cancel(proc: subprocess.Popen, cancel: threading.Event | None) -> N
     threading.Thread(target=_watch, daemon=True).start()
 
 
+def _login_state_dir(cfg: Config) -> Path:
+    """Where DepotDownloader keeps its remembered-login ``account.config``.
+
+    DepotDownloader reads/writes account.config relative to its working directory,
+    so pin it to a fixed dir inside the data root (which is recomputed from the exe
+    location every launch). That way the saved Steam download login travels with the
+    app folder when it's moved and survives Velopack updates, instead of landing in
+    whatever ambient CWD the process happened to start in (and getting lost).
+    """
+    d = cfg.project_root / "steam_session"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def steam_login(
     cfg: Config,
     build: Build,
@@ -110,6 +124,7 @@ def steam_login(
     ]
     proc = subprocess.Popen(  # noqa: S603
         [str(exe), *args],
+        cwd=str(_login_state_dir(cfg)),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=0, creationflags=_NO_WINDOW,
     )
@@ -187,6 +202,7 @@ def steam_login_qr(
     ]
     proc = subprocess.Popen(  # noqa: S603
         [str(exe), *args],
+        cwd=str(_login_state_dir(cfg)),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=0, creationflags=_NO_WINDOW,
     )
@@ -265,6 +281,7 @@ def _run_capturing(
     args: list[str],
     progress: Callable[[float], None] | None,
     cancel: threading.Event | None = None,
+    cwd: str | None = None,
 ) -> tuple[int, str]:
     r"""Run DepotDownloader, reporting the latest percentage and returning the
     ``(returncode, recent non-progress output)`` so the caller can classify a
@@ -277,6 +294,7 @@ def _run_capturing(
     """
     proc = subprocess.Popen(  # noqa: S603
         [str(exe), *args],
+        cwd=cwd,
         stdin=subprocess.DEVNULL,  # never let a stale-login password prompt block forever
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -349,11 +367,12 @@ def _run_with_retry(
     cancel: threading.Event | None = None,
 ) -> None:
     exe = tools.ensure_depotdownloader(cfg)
+    state_dir = str(_login_state_dir(cfg))  # reuse the remembered login written at sign-in
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         if cancel is not None and cancel.is_set():
             raise DownloadCancelled("Download cancelled.")
         print(f"DepotDownloader attempt {attempt}/{_MAX_ATTEMPTS}")
-        returncode, output = _run_capturing(exe, args, progress, cancel)
+        returncode, output = _run_capturing(exe, args, progress, cancel, cwd=state_dir)
         if returncode == 0:
             return
         # Don't burn minutes retrying an error a retry can't fix (wrong/expired

@@ -89,7 +89,7 @@ def _clean_stale_workdirs(cfg: Config) -> None:
     work = _launch_work(cfg)
     if not work.exists():
         return
-    keep = {"builds", "saved_builds.json", "saved_builds.json.tmp", "steam_wrapper"}
+    keep = {"builds", "saved_builds.json", "saved_builds.json.tmp"}
     for child in work.iterdir():
         if child.name in keep:
             continue

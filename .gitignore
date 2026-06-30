@@ -23,6 +23,9 @@ AgeIV_Replay_*
 /.aoe4-restore/
 /.aoe4-work/
 
+# --- DepotDownloader remembered-login state (contains a Steam token; never commit) ---
+/steam_session/
+
 # --- Python ---
 __pycache__/
 *.py[cod]
