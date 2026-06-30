@@ -21,10 +21,21 @@ from pathlib import Path
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _FALLBACK_LOG = Path(os.environ.get("TEMP", ".")) / "aoe4-replay-wrapper.log"
+_LOG_MAX_BYTES = 1_000_000  # rotate the log past ~1 MB; keep a single .1 backup
 
 
 def _log(log_path: Path, line: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Every AoE4 launch goes through the dispatcher and appends here, so cap the
+    # file: once it passes ~1 MB roll it to wrapper.log.1 and start fresh. Rotation
+    # is best-effort so logging never breaks a launch.
+    with contextlib.suppress(OSError):
+        if log_path.exists() and log_path.stat().st_size >= _LOG_MAX_BYTES:
+            backup = log_path.with_suffix(log_path.suffix + ".1")
+            with contextlib.suppress(OSError):
+                if backup.exists():
+                    backup.unlink()
+                log_path.rename(backup)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
 
@@ -179,7 +190,10 @@ def run_config(config_path: Path, steam_command: list[str] | None = None) -> int
 
 
 def _active_request(dispatch: dict, log_path: Path) -> dict | None:
-    request_path = Path(dispatch["request"])
+    raw = dispatch.get("request")
+    if not raw:
+        return None
+    request_path = Path(str(raw))
     try:
         data = json.loads(request_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -218,22 +232,32 @@ def _passthrough_command(dispatch: dict, steam_command: list[str], log_path: Pat
 
 def run_dispatch(config_path: Path, steam_command: list[str] | None = None) -> int:
     """Run an active replay request, or pass Steam's normal command through."""
+    cmd = [str(x) for x in (steam_command or [])]
     try:
         dispatch = json.loads(Path(config_path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         _log(_FALLBACK_LOG, f"dispatch config unavailable: {config_path} ({exc})")
-        return _passthrough_command({}, [str(x) for x in (steam_command or [])], _FALLBACK_LOG)
-    log_path = Path(dispatch["log"])
+        return _passthrough_command({}, cmd, _FALLBACK_LOG)
+    if not isinstance(dispatch, dict):
+        _log(_FALLBACK_LOG, f"dispatch config is not an object: {config_path}")
+        return _passthrough_command({}, cmd, _FALLBACK_LOG)
+    # Tolerate a missing/blank "log" so a partially-corrupt config can't crash us.
+    log_path = Path(str(dispatch.get("log") or _FALLBACK_LOG))
     _log(log_path, f"dispatch argv={sys.argv!r}")
     _log(log_path, f"dispatch config={config_path}")
 
     request = _active_request(dispatch, log_path)
     if request is not None:
         _log(log_path, f"active request token={request.get('token')!r}")
-        return _run_target(request, steam_command)
+        # A corrupt request (missing/invalid keys) must fall back to a normal launch,
+        # never crash — otherwise even normal Steam Play would fail.
+        try:
+            return _run_target(request, steam_command)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            _log(log_path, f"active request unusable ({exc}); passing through")
 
     _log(log_path, "no active replay request; passing through to Steam command")
-    return _passthrough_command(dispatch, [str(x) for x in (steam_command or [])], log_path)
+    return _passthrough_command(dispatch, cmd, log_path)
 
 
 def main(argv: list[str] | None = None) -> int:

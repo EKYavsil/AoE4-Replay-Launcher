@@ -7,9 +7,12 @@ from the manifest history.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -109,15 +112,35 @@ def build_to_entry(build: Build) -> dict:
     return entry
 
 
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 40, delay: float = 0.02) -> None:
+    """``os.replace``, retried on Windows' transient PermissionError when several
+    writers race to replace the same destination at the same instant."""
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def save_build_map(builds: list[Build], path: Path) -> None:
     ordered = sorted(builds, key=lambda b: b.valid_from or datetime.min)
     entries = [build_to_entry(b) for b in ordered]
     # Atomic write: a concurrent reader / a crash mid-write never sees a corrupt
-    # (half-written) build map.
+    # (half-written) build map. The temp name is unique per writer so two threads
+    # (or processes) saving at once can't clobber each other's temp — a fixed name
+    # races to a Windows PermissionError on os.replace.
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(entries, indent=4), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(entries, indent=4), encoding="utf-8")
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 @dataclass(frozen=True)

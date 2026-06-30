@@ -63,7 +63,16 @@ from tkinter import filedialog  # noqa: E402
 import customtkinter as ctk  # noqa: E402 - must follow _ensure_tcl_tk()
 from PIL import Image  # noqa: E402
 
-from . import aoe4world, buildcache, config, launch, replay, service, steamqr  # noqa: E402
+from . import (  # noqa: E402
+    __version__,
+    aoe4world,
+    buildcache,
+    config,
+    launch,
+    replay,
+    service,
+    steamqr,
+)
 
 # ---- palette / glyphs -----------------------------------------------------
 
@@ -286,6 +295,13 @@ class Panel(ctk.CTk):
         # restore mods if a previous session was force-closed while a replay ran
         with contextlib.suppress(Exception):
             launch.recover_user_mods(self.cfg)
+        # if the app was moved/updated, re-point the persistent Steam shim at the live exe
+        with contextlib.suppress(Exception):
+            launch.heal_wrapper_paths(self.cfg)
+        # drop an orphaned replay request from a crashed session, so a stale request
+        # can't make a later normal Play open the wrong (old) build
+        with contextlib.suppress(Exception):
+            launch._clear_active_replay_request(self.cfg)
         # drop composed builds left over from previous sessions (keeps saved ones)
         with contextlib.suppress(Exception):
             buildcache.cleanup(self.cfg)
@@ -775,12 +791,20 @@ class Panel(ctk.CTk):
             label_font=self.font_head,
         )
         self.downloads.pack(fill="both", expand=True)
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=18, pady=(0, 6))
         ctk.CTkLabel(
-            self,
+            footer,
+            text=f"v{__version__}",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=10),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            footer,
             text="🔹by Zavarash",
             text_color=MUTED,
             font=ctk.CTkFont(size=10),
-        ).pack(anchor="e", padx=18, pady=(0, 6))
+        ).pack(side="right")
         self.after(100, self._set_initial_split)
 
     def _set_initial_split(self) -> None:
@@ -2038,6 +2062,22 @@ class Panel(ctk.CTk):
         except Exception as exc:  # noqa: BLE001 - surface "open Steam" as a warning
             self._info("Steam not running", str(exc))
             return
+        # An old build installs the persistent Steam wrapper, which needs a one-time
+        # Steam restart. Warn the user (the account picker may appear) before it runs.
+        restart_warn = False
+        with contextlib.suppress(Exception):
+            restart_warn = (
+                not service._is_current_build(self.cfg, path)
+                and launch.wrapper_restart_pending(self.cfg)
+            )
+        if restart_warn and not self._confirm(
+            "Steam will restart once",
+            "To set up the replay connection, we'll restart Steam once. "
+            "If the account picker appears, please select your account manually to "
+            "continue.",
+            ok="Continue", cancel="Cancel",
+        ):
+            return
         # Connect a Steam account only when it's actually needed: an old build has
         # to be downloaded, but a replay on the installed build plays without it.
         if self._needs_steam_connection(path):
@@ -2396,7 +2436,10 @@ class Panel(ctk.CTk):
 
     def _run_update(self, mgr, info) -> None:
         def progress(pct: int) -> None:
-            self.after(0, lambda p=pct: self.status.configure(text=f"Downloading update… {int(p)}%"))
+            self.after(
+                0,
+                lambda p=pct: self.status.configure(text=f"Downloading update… {int(p)}%"),
+            )
 
         try:
             self.after(0, lambda: self.status.configure(text="Downloading update…"))

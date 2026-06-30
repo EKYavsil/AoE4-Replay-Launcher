@@ -62,6 +62,16 @@ jobs:
           dotnet tool install -g vpk --version 1.2.0
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
+      # The PyInstaller spec bundles packaging/steamshim.exe (the native Steam launch
+      # shim) into the build, but the compiled .exe is gitignored — so build it here
+      # from steamshim.c. Same flags as the local build: static (no MinGW DLL deps),
+      # windowed (no console), Unicode entry. gcc (Mingw-w64) ships on windows runners.
+      - name: Compile the native Steam shim (steamshim.exe)
+        run: |
+          gcc --version
+          gcc -O2 -s -static -municode -mwindows packaging/steamshim.c -o packaging/steamshim.exe
+          ls -l packaging/steamshim.exe
+
       - name: Build the onedir bundle with PyInstaller
         run: pyinstaller packaging/AoE4-Replay-Launcher.spec --noconfirm
 

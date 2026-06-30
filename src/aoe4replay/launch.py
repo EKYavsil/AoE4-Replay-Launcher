@@ -36,6 +36,10 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console pop-ups un
 # the Steam registry keys — keeps the binary off antivirus heuristics that flag a
 # downloader-style exe for polling HKCU\Software\Valve\Steam right after spawning a child.
 _STEAM_SETTLE_SECONDS = 15
+# A one-shot active replay request is consumed within seconds of the steam
+# -applaunch that triggers the wrapper. Expire it quickly so a launcher that died
+# mid-launch can't make a later normal Play open the wrong (old) build.
+_REQUEST_TTL_SECONDS = 180
 
 
 class _FixedFileInfo(ctypes.Structure):
@@ -133,8 +137,16 @@ def ensure_steam_running(cfg: Config) -> None:
 
 # --- Steam install / active user discovery (for the LaunchOptions wrapper) -----
 
-def _steam_root() -> Path:
-    """Steam install root, discovered from the registry."""
+def _steam_root(cfg: Config | None = None) -> Path:
+    """Steam install root. Prefer the configured steam.exe's folder so every Steam
+    operation (shutdown, localconfig, start) targets the *same* client; fall back to
+    registry discovery when no override is set."""
+    if cfg is not None:
+        exe = getattr(cfg, "steam_exe", None)
+        if exe is not None:
+            root = Path(exe).parent
+            if root.is_dir():
+                return root
     try:
         import winreg
 
@@ -172,8 +184,8 @@ def _active_user_id() -> str:
     raise RuntimeError("Please open Steam and log into your account, then try again.")
 
 
-def _localconfig_path() -> Path:
-    return _steam_root() / "userdata" / _active_user_id() / "config" / "localconfig.vdf"
+def _localconfig_path(cfg: Config | None = None) -> Path:
+    return _steam_root(cfg) / "userdata" / _active_user_id() / "config" / "localconfig.vdf"
 
 
 # --- wrapper runtime paths ----------------------------------------------------
@@ -196,8 +208,8 @@ def _steam_wrapper_request(cfg: Config) -> Path:
 
 # --- one-time Steam restart (LaunchOptions are only read on Steam start) -------
 
-def _shutdown_steam(timeout: int = 60) -> None:
-    steam = _steam_root() / "steam.exe"
+def _shutdown_steam(cfg: Config | None = None, timeout: int = 60) -> None:
+    steam = _steam_root(cfg) / "steam.exe"
     if steam.is_file():
         subprocess.run([str(steam), "-shutdown"], check=False, creationflags=_NO_WINDOW)
     deadline = time.time() + timeout
@@ -326,14 +338,35 @@ def _child(node: dict, key: str) -> dict:
     return value
 
 
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 40, delay: float = 0.02) -> None:
+    """``os.replace``, retried on Windows' transient PermissionError when two
+    launcher instances race to replace the same %LocalAppData% file at once."""
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _write_text_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding=encoding) as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    # Unique temp name: two launcher instances share %LocalAppData% and could write
+    # the same file at once. A fixed .tmp would let them clobber each other mid-write;
+    # per-writer temps keep os.replace atomic (last writer wins on the final file).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
@@ -426,9 +459,14 @@ def _write_shim_cfg(cfg: Config, check_path: str, prefix: str) -> None:
     """
     path = _steam_wrapper_root(cfg) / "shim.cfg"
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(f"{check_path}\n{prefix}\n", encoding="utf-16-le")
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(f"{check_path}\n{prefix}\n", encoding="utf-16-le")
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def _is_dispatch_launch_options(value: str) -> bool:
@@ -505,7 +543,7 @@ def _write_active_replay_request(
         "game_args": game_args,
         "log": str(root / "wrapper.log"),
         "created_at": now,
-        "expires_at": now + 7200,  # TTL: a stale request never fires on a later Steam Play
+        "expires_at": now + _REQUEST_TTL_SECONDS,  # short TTL: no stale-request hijack
     }
     if runasdate_exe is not None and runasdate_when is not None:
         # Same date/time format the launcher has always passed to RunAsDate.
@@ -530,7 +568,7 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
     loaded. Once installed, replay launches only write ``active_request.json`` and
     call ``steam -applaunch``; no Steam restart is needed.
     """
-    localconfig = _localconfig_path()
+    localconfig = _localconfig_path(cfg)
     if not localconfig.is_file():
         raise FileNotFoundError(f"Steam localconfig.vdf was not found: {localconfig}")
 
@@ -559,11 +597,64 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
         return False
 
     print("Installing Steam replay wrapper integration (one-time Steam restart)...")
-    _shutdown_steam()
-    _set_launch_options(localconfig, cfg.app_id, desired)
-    _start_steam(cfg)
+    _shutdown_steam(cfg)
+    # Always bring Steam back, even if writing LaunchOptions fails — otherwise a
+    # failed write would leave Steam closed and the user stuck reopening it manually.
+    try:
+        _set_launch_options(localconfig, cfg.app_id, desired)
+    finally:
+        _start_steam(cfg)
     _wait_for_steam_ready()
     return True
+
+
+def wrapper_restart_pending(cfg: Config) -> bool:
+    """True if installing the replay wrapper would require the one-time Steam
+    restart (LaunchOptions don't yet point at our wrapper). Read-only, best-effort
+    — used to warn the user before an old-build replay triggers the restart. Mirrors
+    the ``current != desired`` decision in _ensure_steam_wrapper_integration.
+    """
+    try:
+        localconfig = _localconfig_path(cfg)
+        if not localconfig.is_file():
+            return False
+        current = _get_launch_options(localconfig, cfg.app_id)
+    except Exception:  # noqa: BLE001 - prediction must never block a launch
+        return False
+    if getattr(sys, "frozen", False) and _bundled_shim_path() is not None:
+        desired = f"{_quote_arg(_shim_exe_path(cfg))} %command%"
+    else:
+        desired = f"{_dispatcher_prefix(_steam_wrapper_dispatch_config(cfg))} %command%"
+    return current != desired
+
+
+def heal_wrapper_paths(cfg: Config) -> None:
+    """Refresh the shim's stored launcher path if the app was moved (or updated).
+
+    The shim lives in %LocalAppData% and survives a move; only the launcher path it
+    stores (shim.cfg) goes stale. When stale, normal Play still works (the shim
+    falls back to passing Steam's command through), and an old-build replay would
+    self-heal on launch — but refreshing here keeps the shim pointed at the live
+    launcher immediately. No Steam restart: LaunchOptions still points at the
+    (unmoved) shim. Best-effort, packaged builds only, and only when already set up.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    cfg_path = _steam_wrapper_root(cfg) / "shim.cfg"
+    if not cfg_path.is_file():
+        return
+    try:
+        text = cfg_path.read_text(encoding="utf-16-le")
+    except OSError:
+        return
+    stored_check = (text.lstrip("﻿").splitlines() or [""])[0]
+    current = str(Path(sys.executable))
+    if stored_check == current:
+        return  # already pointing at the live launcher
+    prefix = _dispatcher_prefix(_steam_wrapper_dispatch_config(cfg))
+    with contextlib.suppress(OSError):
+        _write_shim_cfg(cfg, current, prefix)
+        print("Refreshed Steam shim path after the launcher moved/updated.")
 
 
 # --- temporary user-mods handling (unchanged from the direct-launch design) ----
@@ -680,6 +771,9 @@ def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = Fal
     ensure_steam_running(cfg)
     mods_state = None if keep_mods else disable_user_mods(cfg)
     try:
+        # Drop any stale old-build request so the wrapper passes this current-build
+        # replay straight through instead of dispatching an old build.
+        _clear_active_replay_request(cfg)
         args = [
             str(cfg.steam_exe), "-applaunch", cfg.app_id,
             "-dev", "-replay", f"playback:{replay_name}",
