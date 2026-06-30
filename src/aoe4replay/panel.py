@@ -2070,24 +2070,60 @@ class Panel(ctk.CTk):
                 not service._is_current_build(self.cfg, path)
                 and launch.wrapper_restart_pending(self.cfg)
             )
-        if restart_warn and not self._confirm(
-            "Steam will restart once",
-            "To set up the replay connection, we'll restart Steam once. "
-            "If the account picker appears, please select your account manually to "
-            "continue.",
-            ok="Continue", cancel="Cancel",
-        ):
+        if restart_warn:
+            if not self._confirm(
+                "Steam will restart once",
+                "To set up the replay connection, we'll restart Steam once. "
+                "If the account picker appears, please select your account manually to "
+                "continue.",
+                ok="Continue", cancel="Cancel",
+            ):
+                return
+            # Do the one-time restart NOW — before the download/sign-in — off the UI
+            # thread, then continue to the (possibly needed) sign-in and play.
+            self._setup_wrapper_then_play(path)
             return
+        self._continue_play(path)
+
+    def _continue_play(self, path: Path) -> None:
         # Connect a Steam account only when it's actually needed: an old build has
         # to be downloaded, but a replay on the installed build plays without it.
         if self._needs_steam_connection(path):
             self._prompt_steam_login(
-                on_success=lambda: self._start_play(
-                    path, just_connected=True, setup_wrapper=restart_warn
-                )
+                on_success=lambda: self._start_play(path, just_connected=True)
             )
             return
-        self._start_play(path, setup_wrapper=restart_warn)
+        self._start_play(path)
+
+    def _setup_wrapper_then_play(self, path: Path) -> None:
+        """Install the Steam wrapper (the one-time restart) up front, off the UI
+        thread, then continue. Runs right after the user confirms — before any
+        download or Steam sign-in — so the restart isn't deferred to the end."""
+        self._playing = True  # block re-entry while Steam restarts
+        for btn in self._play_buttons:
+            btn.configure(state="disabled")
+        self.status.configure(text="Setting up Steam for replays…")
+
+        def worker() -> None:
+            err = None
+            try:
+                launch.ensure_steam_wrapper(self.cfg)
+            except Exception as exc:  # noqa: BLE001 - surface a restart failure
+                err = str(exc)
+            self.after(0, lambda: self._wrapper_setup_done(path, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _wrapper_setup_done(self, path: Path, err: str | None) -> None:
+        self._playing = False  # _continue_play / _start_play re-acquires it
+        for btn in self._play_buttons:
+            btn.configure(state="normal")
+        self.notify.configure(text="")
+        if err:
+            self.status.configure(text="Ready.")
+            self._error("Steam setup failed", err)
+            return
+        self._continue_play(path)
 
     def _game_exe_at(self, path: Path) -> bool:
         with contextlib.suppress(Exception):
@@ -2136,9 +2172,7 @@ class Panel(ctk.CTk):
                 return False
         return True  # old / unknown build -> will download -> needs a connection
 
-    def _start_play(
-        self, path: Path, just_connected: bool = False, setup_wrapper: bool = False
-    ) -> None:
+    def _start_play(self, path: Path, just_connected: bool = False) -> None:
         self._playing = True
         self._cancel_event = threading.Event()
         for btn in self._play_buttons:
@@ -2163,16 +2197,6 @@ class Panel(ctk.CTk):
             cancelled = False
             auth_failed = False
             try:
-                if setup_wrapper:
-                    # Do the one-time Steam restart up front (right after the user
-                    # confirmed) rather than after a long download, so there's no
-                    # surprise restart at the end and the account picker (if any)
-                    # shows while the user is still at the screen.
-                    self.after(0, lambda: warning.configure(
-                        text="Setting up Steam for replays (one-time restart)…",
-                        text_color=GREEN,
-                    ))
-                    launch.ensure_steam_wrapper(self.cfg)
                 built = service.watch_replay(
                     self.cfg, path, progress=report, cancel=self._cancel_event
                 )
