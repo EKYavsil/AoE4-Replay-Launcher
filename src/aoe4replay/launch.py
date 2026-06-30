@@ -608,6 +608,17 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
     return True
 
 
+def ensure_steam_wrapper(cfg: Config) -> bool:
+    """Install the persistent Steam wrapper (the one-time Steam restart) up front.
+
+    Lets the UI do the restart right after the user confirms it — before the (often
+    long) build download — instead of mid-launch at the very end. Idempotent: if the
+    wrapper is already installed it returns False without restarting. The later
+    per-launch call in launch_replay then becomes a no-op.
+    """
+    return _ensure_steam_wrapper_integration(cfg)
+
+
 def wrapper_restart_pending(cfg: Config) -> bool:
     """True if installing the replay wrapper would require the one-time Steam
     restart (LaunchOptions don't yet point at our wrapper). Read-only, best-effort

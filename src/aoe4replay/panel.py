@@ -2082,10 +2082,12 @@ class Panel(ctk.CTk):
         # to be downloaded, but a replay on the installed build plays without it.
         if self._needs_steam_connection(path):
             self._prompt_steam_login(
-                on_success=lambda: self._start_play(path, just_connected=True)
+                on_success=lambda: self._start_play(
+                    path, just_connected=True, setup_wrapper=restart_warn
+                )
             )
             return
-        self._start_play(path)
+        self._start_play(path, setup_wrapper=restart_warn)
 
     def _game_exe_at(self, path: Path) -> bool:
         with contextlib.suppress(Exception):
@@ -2134,7 +2136,9 @@ class Panel(ctk.CTk):
                 return False
         return True  # old / unknown build -> will download -> needs a connection
 
-    def _start_play(self, path: Path, just_connected: bool = False) -> None:
+    def _start_play(
+        self, path: Path, just_connected: bool = False, setup_wrapper: bool = False
+    ) -> None:
         self._playing = True
         self._cancel_event = threading.Event()
         for btn in self._play_buttons:
@@ -2159,6 +2163,16 @@ class Panel(ctk.CTk):
             cancelled = False
             auth_failed = False
             try:
+                if setup_wrapper:
+                    # Do the one-time Steam restart up front (right after the user
+                    # confirmed) rather than after a long download, so there's no
+                    # surprise restart at the end and the account picker (if any)
+                    # shows while the user is still at the screen.
+                    self.after(0, lambda: warning.configure(
+                        text="Setting up Steam for replays (one-time restart)…",
+                        text_color=GREEN,
+                    ))
+                    launch.ensure_steam_wrapper(self.cfg)
                 built = service.watch_replay(
                     self.cfg, path, progress=report, cancel=self._cancel_event
                 )
