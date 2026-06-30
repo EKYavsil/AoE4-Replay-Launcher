@@ -36,6 +36,11 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console pop-ups un
 # the Steam registry keys — keeps the binary off antivirus heuristics that flag a
 # downloader-style exe for polling HKCU\Software\Valve\Steam right after spawning a child.
 _STEAM_SETTLE_SECONDS = 15
+# Steam writes localconfig.vdf as it shuts down; on some machines the process leaves
+# the task list a moment before that flush lands on disk. Wait this long after Steam
+# is gone before writing our LaunchOptions, so Steam's trailing flush can't overwrite
+# (clobber) it. The whole one-time-restart install relies on this write surviving.
+_STEAM_SHUTDOWN_SETTLE = 5
 # A one-shot active replay request is consumed within seconds of the steam
 # -applaunch that triggers the wrapper. Expire it quickly so a launcher that died
 # mid-launch can't make a later normal Play open the wrong (old) build.
@@ -215,6 +220,7 @@ def _shutdown_steam(cfg: Config | None = None, timeout: int = 60) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _process_running("steam.exe"):
+            time.sleep(_STEAM_SHUTDOWN_SETTLE)  # let Steam's trailing localconfig flush land
             return
         time.sleep(1)
     raise RuntimeError("Steam did not close in time. Close Steam manually and try again.")
@@ -226,13 +232,19 @@ def _start_steam(cfg: Config) -> None:
     subprocess.Popen([str(cfg.steam_exe)], creationflags=_NO_WINDOW)
 
 
-def _wait_for_steam_ready(timeout: int = 120) -> None:
+def _wait_for_steam_ready(timeout: int = 180) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _process_running("steam.exe") and _steam_logged_in():
             return
         time.sleep(1)
-    raise RuntimeError("Steam did not come back online in time. Open Steam and try again.")
+    # The usual cause is simply that the user hasn't picked their account in Steam's
+    # sign-in window yet — the connection is fine, Steam just isn't signed in. Say so
+    # (not "connection failed") and tell them how to continue.
+    raise RuntimeError(
+        "Steam restarted but no account is signed in yet. Sign in to Steam "
+        "(select your account if the picker appears), then click Play again."
+    )
 
 
 # --- minimal VDF parser/formatter for localconfig.vdf -------------------------
@@ -378,11 +390,27 @@ def _set_launch_options(localconfig: Path, app_id: str, launch_options: str) -> 
     apps = _child(_child(_child(data, "Software"), "Valve"), "Steam")
     app = _child(_child(apps, "apps"), app_id)
     app["LaunchOptions"] = launch_options
-    _write_text_atomic(localconfig, _format_vdf(root, data))
+    new_text = _format_vdf(root, data)
+    # Safety net for the app's backbone: never hand Steam a file we can't reproduce.
+    # Re-parse our own output and confirm it round-trips to exactly the data we meant
+    # to write. This catches any formatter/parser defect *before* it could corrupt the
+    # user's Steam config — a write that wouldn't round-trip is refused, not applied.
+    try:
+        root2, data2 = _parse_vdf(new_text)
+    except ValueError as exc:
+        raise RuntimeError(f"Refusing to write a malformed localconfig.vdf ({exc}).") from exc
+    if root2 != root or data2 != data:
+        raise RuntimeError(
+            "Refusing to write localconfig.vdf: the rewrite did not round-trip cleanly."
+        )
+    _write_text_atomic(localconfig, new_text)
 
 
 def _get_launch_options(localconfig: Path, app_id: str) -> str:
-    _root, data = _parse_vdf(localconfig.read_text(encoding="utf-8", errors="replace"))
+    try:
+        _root, data = _parse_vdf(localconfig.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return ""  # unreadable/malformed -> treat as "no launch options", never crash
     node: object = data
     for key in ("Software", "Valve", "Steam", "apps", app_id):
         if not isinstance(node, dict):
@@ -597,15 +625,29 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
         return False
 
     print("Installing Steam replay wrapper integration (one-time Steam restart)...")
-    _shutdown_steam(cfg)
-    # Always bring Steam back, even if writing LaunchOptions fails — otherwise a
-    # failed write would leave Steam closed and the user stuck reopening it manually.
-    try:
-        _set_launch_options(localconfig, cfg.app_id, desired)
-    finally:
-        _start_steam(cfg)
-    _wait_for_steam_ready()
-    return True
+    for _attempt in range(2):
+        _shutdown_steam(cfg)
+        # Always bring Steam back, even if writing LaunchOptions fails — otherwise a
+        # failed write would leave Steam closed and the user stuck reopening it.
+        try:
+            _set_launch_options(localconfig, cfg.app_id, desired)
+        finally:
+            _start_steam(cfg)
+        _wait_for_steam_ready()
+        # The user may sign into a different account at Steam's picker; re-resolve so we
+        # verify against whatever account Steam came back on (and, on a retry, write to
+        # it). Then confirm the write actually stuck — on some machines Steam's shutdown
+        # flush lands after ours and clobbers it, so retry once if it didn't.
+        with contextlib.suppress(Exception):
+            localconfig = _localconfig_path(cfg)
+        if _get_launch_options(localconfig, cfg.app_id) == desired:
+            return True
+    raise RuntimeError(
+        "Steam keeps resetting the replay launch option after restarting. This is "
+        "usually Steam Cloud or a permission issue overriding it — make sure Steam is "
+        "online and not running as administrator, then try again. You can also set it "
+        "manually in Steam: Age of Empires IV → Properties → Launch Options."
+    )
 
 
 def ensure_steam_wrapper(cfg: Config) -> bool:

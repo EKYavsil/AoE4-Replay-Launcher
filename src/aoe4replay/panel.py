@@ -2121,7 +2121,7 @@ class Panel(ctk.CTk):
         self.notify.configure(text="")
         if err:
             self.status.configure(text="Ready.")
-            self._error("Steam setup failed", err)
+            self._info("Steam isn't ready yet", err)
             return
         self._continue_play(path)
 
