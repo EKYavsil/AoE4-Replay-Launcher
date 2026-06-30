@@ -213,14 +213,16 @@ def _steam_wrapper_request(cfg: Config) -> Path:
 
 # --- one-time Steam restart (LaunchOptions are only read on Steam start) -------
 
-def _shutdown_steam(cfg: Config | None = None, timeout: int = 60) -> None:
+def _shutdown_steam(
+    cfg: Config | None = None, timeout: int = 60, settle: float = _STEAM_SHUTDOWN_SETTLE
+) -> None:
     steam = _steam_root(cfg) / "steam.exe"
     if steam.is_file():
         subprocess.run([str(steam), "-shutdown"], check=False, creationflags=_NO_WINDOW)
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _process_running("steam.exe"):
-            time.sleep(_STEAM_SHUTDOWN_SETTLE)  # let Steam's trailing localconfig flush land
+            time.sleep(settle)  # let Steam's trailing localconfig flush land before we write
             return
         time.sleep(1)
     raise RuntimeError("Steam did not close in time. Close Steam manually and try again.")
@@ -342,8 +344,23 @@ def _format_vdf(root: str, node: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _ci_get(node: dict, key: str) -> object | None:
+    """Look up ``key`` case-insensitively (Steam's VDF keys are case-insensitive, so
+    the file may hold "Apps" where we look for "apps")."""
+    if key in node:
+        return node[key]
+    lowered = key.lower()
+    for existing_key, value in node.items():
+        if existing_key.lower() == lowered:
+            return value
+    return None
+
+
 def _child(node: dict, key: str) -> dict:
-    value = node.get(key)
+    # Reuse an existing sub-dict of any case (e.g. "Apps" vs "apps") instead of
+    # creating a parallel mis-cased section that Steam would write/read separately
+    # from ours — that mismatch silently drops our LaunchOptions.
+    value = _ci_get(node, key)
     if not isinstance(value, dict):
         value = {}
         node[key] = value
@@ -389,7 +406,10 @@ def _set_launch_options(localconfig: Path, app_id: str, launch_options: str) -> 
     root, data = _parse_vdf(localconfig.read_text(encoding="utf-8", errors="replace"))
     apps = _child(_child(_child(data, "Software"), "Valve"), "Steam")
     app = _child(_child(apps, "apps"), app_id)
-    app["LaunchOptions"] = launch_options
+    # Update the existing LaunchOptions key in whatever case Steam wrote it, so we don't
+    # leave a duplicate (e.g. "launchoptions" + "LaunchOptions") that Steam may ignore.
+    lo_key = next((k for k in app if k.lower() == "launchoptions"), "LaunchOptions")
+    app[lo_key] = launch_options
     new_text = _format_vdf(root, data)
     # Safety net for the app's backbone: never hand Steam a file we can't reproduce.
     # Re-parse our own output and confirm it round-trips to exactly the data we meant
@@ -415,9 +435,9 @@ def _get_launch_options(localconfig: Path, app_id: str) -> str:
     for key in ("Software", "Valve", "Steam", "apps", app_id):
         if not isinstance(node, dict):
             return ""
-        node = node.get(key)
+        node = _ci_get(node, key)  # case-insensitive, matching how Steam reads/writes
     if isinstance(node, dict):
-        value = node.get("LaunchOptions")
+        value = _ci_get(node, "LaunchOptions")
         return str(value) if value is not None else ""
     return ""
 
@@ -625,12 +645,26 @@ def _ensure_steam_wrapper_integration(cfg: Config) -> bool:
         return False
 
     print("Installing Steam replay wrapper integration (one-time Steam restart)...")
-    for _attempt in range(2):
-        _shutdown_steam(cfg)
+    # Escalate the post-shutdown settle on the retry: a slow (e.g. HDD) Steam disk can
+    # flush localconfig later than the first wait, so give the second attempt a wider
+    # window before deciding Steam keeps clobbering the write.
+    for settle in (_STEAM_SHUTDOWN_SETTLE, _STEAM_SHUTDOWN_SETTLE + 7):
+        _shutdown_steam(cfg, settle=settle)
         # Always bring Steam back, even if writing LaunchOptions fails — otherwise a
         # failed write would leave Steam closed and the user stuck reopening it.
         try:
             _set_launch_options(localconfig, cfg.app_id, desired)
+        except PermissionError as exc:
+            # finally still runs (Steam restarts); turn the raw "Access is denied" into
+            # something the user can act on — this is almost always Steam running as
+            # administrator, a read-only config, or antivirus locking the file.
+            raise RuntimeError(
+                "Couldn't write Steam's launch options — access denied. This usually "
+                "means Steam is running as administrator (close it and start it "
+                "normally), the config file is read-only, or antivirus is blocking it. "
+                "You can also set it manually: Age of Empires IV → Properties → "
+                "Launch Options."
+            ) from exc
         finally:
             _start_steam(cfg)
         _wait_for_steam_ready()
