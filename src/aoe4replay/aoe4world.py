@@ -72,6 +72,31 @@ def _civ_abbrev(civ: object) -> str:
     return _CIV_ABBREV.get(key) or key[:3].upper()
 
 
+def _team_rosters(game: dict) -> list[list[dict]]:
+    """Each team as a list of ``{"name", "civ", "_pid"}`` for its players, taken
+    straight from the already-fetched game object — the games list carries every
+    player, so building a full team roster needs no extra request."""
+    rosters: list[list[dict]] = []
+    for team in game.get("teams") or []:
+        roster: list[dict] = []
+        for slot in team if isinstance(team, list) else []:
+            player = slot.get("player") if isinstance(slot, dict) else None
+            if not isinstance(player, dict):
+                player = slot if isinstance(slot, dict) else {}
+            pid = player.get("profile_id")
+            if pid:
+                roster.append(
+                    {
+                        "name": player.get("name") or str(pid),
+                        "civ": _civ_abbrev(player.get("civilization")),
+                        "_pid": pid,
+                    }
+                )
+        if roster:
+            rosters.append(roster)
+    return rosters
+
+
 def game_id_from_name(name: str) -> int | None:
     """Extract the aoe4world game id from a replay filename.
 
@@ -336,12 +361,25 @@ def match_summary(game: dict, id1: int, id2: int) -> dict:
     win2 = _player_field(game, id2, "result") == "win"
     winner = id1 if win1 and not win2 else id2 if win2 and not win1 else None
 
+    # Full team rosters for the hover tooltip (team games only). FFA has no real
+    # teams, so both sides expose every participant. 1v1 rosters are size 1, which
+    # the UI treats as "nothing extra to show".
+    rosters = _team_rosters(game)
+    if "ffa" in (game.get("kind") or ""):
+        everyone = [p for r in rosters for p in r]
+        team1 = team2 = everyone
+    else:
+        team1 = next((r for r in rosters if any(p["_pid"] == id1 for p in r)), [])
+        team2 = next((r for r in rosters if any(p["_pid"] == id2 for p in r)), [])
+
     return {
         "game_id": _game_id(game),
         "name1": _player_field(game, id1, "name") or str(id1),
         "name2": _player_field(game, id2, "name") or str(id2),
         "civ1": _civ_abbrev(_player_field(game, id1, "civilization")),
         "civ2": _civ_abbrev(_player_field(game, id2, "civilization")),
+        "team1": team1,
+        "team2": team2,
         "map": map_name,
         "kind": game.get("kind") or "?",
         "duration": game.get("duration"),

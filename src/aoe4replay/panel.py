@@ -1241,7 +1241,8 @@ class Panel(ctk.CTk):
         result_known = left_won or right_won
 
         self._match_player(
-            mf, s["name1"], s.get("civ1"), left_won, result_known, side="left"
+            mf, s["name1"], s.get("civ1"), left_won, result_known,
+            side="left", roster=s.get("team1"),
         )
         vs_image = self._asset_image("vs.png", (24, 24))
         ctk.CTkLabel(
@@ -1252,7 +1253,8 @@ class Panel(ctk.CTk):
             font=self.font_normal,
         ).pack(side="left", padx=8)
         self._match_player(
-            mf, s["name2"], s.get("civ2"), right_won, result_known, side="right"
+            mf, s["name2"], s.get("civ2"), right_won, result_known,
+            side="right", roster=s.get("team2"),
         )
         return mf
 
@@ -1265,6 +1267,7 @@ class Panel(ctk.CTk):
         result_known: bool,
         *,
         side: str,
+        roster: list[dict] | None = None,
     ) -> None:
         color = GREEN if won else LOSS if result_known else TEXT
         win_image = self._asset_image("win.png", (28, 25)) if won else None
@@ -1284,7 +1287,10 @@ class Panel(ctk.CTk):
                 font=self.font_normal,
             ).pack(side="left", padx=(0, 5))
 
-        ctk.CTkLabel(parent, text=name, text_color=color, font=self.font_bold).pack(side="left")
+        name_lbl = ctk.CTkLabel(parent, text=name, text_color=color, font=self.font_bold)
+        name_lbl.pack(side="left")
+        if roster and len(roster) > 1:  # team game / FFA -> hover shows the full roster
+            self._bind_team_tooltip(name_lbl, roster)
 
         if side == "left" and civ:
             ctk.CTkLabel(
@@ -1299,6 +1305,98 @@ class Panel(ctk.CTk):
             ctk.CTkLabel(
                 parent, text="" if win_image else "WIN", image=win_image
             ).pack(side="left", padx=(5, 0))
+
+    def _bind_team_tooltip(self, widget, roster: list[dict]) -> None:
+        """Hovering the name pops the full team (name + civ). The roster is already
+        in the summary (the games list carries every player) — no extra request."""
+        widget.configure(cursor="hand2")
+        widget.bind("<Enter>", lambda _e: self._show_roster_tip(widget, roster))
+        widget.bind("<Leave>", lambda _e: self._hide_roster_tip())
+        widget.bind("<Destroy>", lambda _e: self._hide_roster_tip())  # card rebuilt mid-hover
+
+    def _roster_tip_window(self) -> ctk.CTkToplevel:
+        """One reused borderless popup — only ever hidden/shown, never destroyed.
+        A single window can't be left orphaned on screen the way a fresh
+        create-per-hover window can (a missed <Leave> would strand it)."""
+        tip = getattr(self, "_roster_tip", None)
+        if tip is None or not tip.winfo_exists():
+            tip = ctk.CTkToplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            self._roster_tip = tip
+        return tip
+
+    def _show_roster_tip(self, widget, roster: list[dict]) -> None:
+        tip = self._roster_tip_window()
+        for child in tip.winfo_children():  # rebuild the content for this roster
+            child.destroy()
+        frame = ctk.CTkFrame(
+            tip, fg_color=PANEL, corner_radius=8, border_width=1, border_color=NEUTRAL
+        )
+        frame.pack()
+        for player in roster:
+            line = ctk.CTkFrame(frame, fg_color="transparent")
+            line.pack(fill="x", padx=12, pady=3)
+            flag = self._civ_image(player.get("civ"))
+            ctk.CTkLabel(  # flag image, or the civ abbreviation when no flag exists
+                line, text="" if flag else (player.get("civ") or ""), image=flag,
+                width=34, text_color=MUTED, font=self.font_normal,
+            ).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(
+                line, text=player["name"], text_color=TEXT, font=self.font_normal, anchor="w"
+            ).pack(side="left")
+        # update_idletasks pumps only redraw/geometry (never mouse events), so it's
+        # safe here and gives the real size — needed to keep a tall FFA roster (up to
+        # 8 rows) fully on screen instead of clipped off the bottom edge.
+        tip.update_idletasks()
+        h, w = tip.winfo_reqheight(), tip.winfo_reqwidth()
+        screen_h, screen_w = self.winfo_screenheight(), self.winfo_screenwidth()
+        x = widget.winfo_rootx()
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        if y + h > screen_h - 8:  # would overflow the bottom -> flip above the name
+            y = max(8, widget.winfo_rooty() - h - 4)
+        if x + w > screen_w - 8:  # would overflow the right -> pull it left
+            x = max(8, screen_w - w - 8)
+        tip.geometry(f"+{x}+{y}")
+        tip.deiconify()
+        tip.lift()
+        self._roster_tip_src = widget
+        if getattr(self, "_roster_tip_poll", None) is None:
+            self._roster_tip_poll = self.after(150, self._poll_roster_tip)
+
+    def _poll_roster_tip(self) -> None:
+        """Safety net for a missed <Leave>: hide once the pointer is no longer over
+        the source name (or that name is gone / the tip is already hidden)."""
+        self._roster_tip_poll = None
+        tip = getattr(self, "_roster_tip", None)
+        widget = getattr(self, "_roster_tip_src", None)
+        if tip is None or not tip.winfo_exists() or not tip.winfo_viewable():
+            return  # already hidden — stop polling until the next show
+        over = False
+        with contextlib.suppress(Exception):
+            px, py = self.winfo_pointerxy()
+            wx, wy = widget.winfo_rootx(), widget.winfo_rooty()
+            over = (
+                widget.winfo_exists()
+                and wx <= px <= wx + widget.winfo_width()
+                and wy <= py <= wy + widget.winfo_height()
+            )
+        if over:
+            self._roster_tip_poll = self.after(150, self._poll_roster_tip)
+        else:
+            self._hide_roster_tip()
+
+    def _hide_roster_tip(self) -> None:
+        poll = getattr(self, "_roster_tip_poll", None)
+        if poll is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(poll)
+            self._roster_tip_poll = None
+        tip = getattr(self, "_roster_tip", None)
+        if tip is not None:
+            with contextlib.suppress(Exception):
+                tip.withdraw()  # reused next time; never destroyed -> can't be stranded
 
     def _game_card(self, parent: ctk.CTkFrame, summary: dict) -> None:
         row = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
