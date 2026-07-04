@@ -108,6 +108,22 @@ ICON_CHECK = "✓"
 ASSET_DIR = Path(__file__).with_name("assets")
 
 INFO_GITHUB_URL = "https://github.com/EKYavsil/AoE4-Replay-Launcher"
+
+# Game-mode filter: dropdown label -> aoe4world `leaderboard` value (None = no filter,
+# applied server-side alongside the date `since`). FFA is quick-match only in AoE4
+# (qm_ffa); there is no ranked FFA leaderboard.
+_MODE_LEADERBOARDS = {
+    "All modes": None,
+    "Ranked 1v1": "rm_1v1",
+    "Ranked 2v2": "rm_2v2",
+    "Ranked 3v3": "rm_3v3",
+    "Ranked 4v4": "rm_4v4",
+    "Quick Match 1v1": "qm_1v1",
+    "Quick Match 2v2": "qm_2v2",
+    "Quick Match 3v3": "qm_3v3",
+    "Quick Match 4v4": "qm_4v4",
+    "Free-for-All": "qm_ffa",
+}
 INFO_DISCORD_URL = "https://discord.gg/HsmQ8wQFA5"
 INFO_GMAIL_URL = "https://mail.google.com/mail/?view=cm&fs=1&to=eyavsil44@gmail.com"
 
@@ -285,9 +301,11 @@ class Panel(ctk.CTk):
         self._pg_searching = False
         self._pg_since: str | None = None  # API server-side lower bound (YYYY-MM-DD)
         self._pg_until: date | None = None  # client-side upper bound
+        self._pg_mode: str | None = None  # server-side leaderboard filter (rm_1v1, qm_ffa, …)
         self._h2h_ids: tuple[int, int] | None = None
         self._h2h_since: str | None = None
         self._h2h_until: date | None = None
+        self._h2h_mode: str | None = None  # server-side leaderboard filter
         self._split_initialized = False
         self._grip_drag_offset = 0
         self._grip_target_y = 0
@@ -1146,8 +1164,10 @@ class Panel(ctk.CTk):
             top, f"{ICON_SEARCH}  Search", 110, self.on_profile_search
         )
         self.p_search_btn.pack(side="left", padx=(0, 8), pady=4)
-        self.p_filter_box, self.p_filter_btn, self.p_filter_clear = self._make_filter_box(
-            top, self._open_profile_filter, self._reset_profile
+        self.p_filter_box, self.p_filter_btn, self.p_filter_clear, self.p_filter_mode = (
+            self._make_filter_box(
+                top, self._open_profile_filter, self._reset_profile, self._apply_profile_mode
+            )
         )
         self.p_status = ctk.CTkLabel(
             top, text="", anchor="w", text_color=MUTED, font=self.font_normal
@@ -1183,8 +1203,10 @@ class Panel(ctk.CTk):
         self.entry2.pack(side="left", padx=(0, 8), pady=4)
         self.search_btn = self._accent_button(top, f"{ICON_SEARCH}  Search", 110, self.on_search)
         self.search_btn.pack(side="left", padx=(0, 8), pady=4)
-        self.h_filter_box, self.h_filter_btn, self.h_filter_clear = self._make_filter_box(
-            top, self._open_h2h_filter, self._reset_h2h
+        self.h_filter_box, self.h_filter_btn, self.h_filter_clear, self.h_filter_mode = (
+            self._make_filter_box(
+                top, self._open_h2h_filter, self._reset_h2h, self._apply_h2h_mode
+            )
         )
 
         self.matches = ctk.CTkScrollableFrame(
@@ -1464,7 +1486,9 @@ class Panel(ctk.CTk):
     def _drop_h2h_filter(self) -> None:
         self._h2h_since = None
         self._h2h_until = None
+        self._h2h_mode = None
         self.h_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
+        self.h_filter_mode.set("All modes")
         self.h_filter_clear.pack_forget()
         self.h_filter_box.pack_forget()
         self.notify.configure(text="")
@@ -1523,7 +1547,9 @@ class Panel(ctk.CTk):
 
     def _search_worker(self, id1: int, id2: int) -> None:
         try:
-            games = aoe4world.h2h_games(id1, id2, since=self._h2h_since)
+            games = aoe4world.h2h_games(
+                id1, id2, since=self._h2h_since, leaderboard=self._h2h_mode
+            )
         except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
             msg = self._api_error_text(exc)
             self.after(0, lambda: self._h2h_failed(msg))
@@ -1556,20 +1582,32 @@ class Panel(ctk.CTk):
 
     # ---- date-range filter (calendar) -------------------------------------
 
-    def _make_filter_box(self, parent, on_open, on_reset):
-        """A (hidden) box holding the 'Date filter' button and, to its right, a
-        reset (✕) button. Same height as the search/entry widgets."""
+    def _make_filter_box(self, parent, on_open, on_reset, on_mode_change):
+        """A (hidden) box holding the 'Date filter' button, a game-mode dropdown, and
+        a reset (✕) button. Same height as the search/entry widgets. Date and mode are
+        independent server-side filters; either or both can be active."""
         box = ctk.CTkFrame(parent, fg_color="transparent")
         btn = ctk.CTkButton(
             box, text=f"{ICON_CAL}  Date filter", height=38, corner_radius=8,
             fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold, command=on_open,
         )
         btn.pack(side="left")
+        mode = ctk.CTkOptionMenu(
+            box, values=list(_MODE_LEADERBOARDS), width=160, height=38, corner_radius=8,
+            # closed control matches the 'Date filter' button (NEUTRAL); the drop-down
+            # list matches the app's other popups (PANEL) instead of the default grey.
+            fg_color=NEUTRAL, button_color=NEUTRAL, button_hover_color=NEUTRAL_HOVER,
+            text_color=TEXT,
+            dropdown_fg_color=PANEL, dropdown_hover_color=NEUTRAL, dropdown_text_color=TEXT,
+            font=self.font_bold, command=on_mode_change,
+        )
+        mode.set("All modes")
+        mode.pack(side="left", padx=(6, 0))
         clear = ctk.CTkButton(
             box, text="✕", width=38, height=38, corner_radius=8,
             fg_color=DANGER, hover_color=DANGER_HOVER, font=self.font_bold, command=on_reset,
         )
-        return box, btn, clear
+        return box, btn, clear, mode
 
     def _pick_date_range(self, on_done) -> None:
         """Open a 'From' calendar, then a 'To' calendar; call on_done(from, to)."""
@@ -1592,16 +1630,23 @@ class Panel(ctk.CTk):
         if self._pg_profile is not None:
             self._start_profile(self._pg_profile)
 
+    def _apply_profile_mode(self, label: str) -> None:
+        self._pg_mode = _MODE_LEADERBOARDS.get(label)
+        if self._pg_profile is not None:
+            self._start_profile(self._pg_profile)
+
     def _reset_profile(self) -> None:
         """✕ resets the tab's top to its initial (just-opened) state."""
         self._pg_profile = None
         self._pg_since = None
         self._pg_until = None
+        self._pg_mode = None
         self._pg_page = 0
         self._pg_total = None
         self._pg_loaded = 0
         self.p_entry.delete(0, "end")
         self.p_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
+        self.p_filter_mode.set("All modes")
         self.p_filter_clear.pack_forget()
         self.p_filter_box.pack_forget()
         self.load_more_btn.pack_forget()
@@ -1623,14 +1668,21 @@ class Panel(ctk.CTk):
         if self._h2h_ids:
             self._start_h2h(*self._h2h_ids)
 
+    def _apply_h2h_mode(self, label: str) -> None:
+        self._h2h_mode = _MODE_LEADERBOARDS.get(label)
+        if self._h2h_ids:
+            self._start_h2h(*self._h2h_ids)
+
     def _reset_h2h(self) -> None:
         """✕ resets the tab's top to its initial (just-opened) state."""
         self._h2h_ids = None
         self._h2h_since = None
         self._h2h_until = None
+        self._h2h_mode = None
         self.entry1.delete(0, "end")
         self.entry2.delete(0, "end")
         self.h_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
+        self.h_filter_mode.set("All modes")
         self.h_filter_clear.pack_forget()
         self.h_filter_box.pack_forget()
         for child in self.matches.winfo_children():
@@ -1652,7 +1704,9 @@ class Panel(ctk.CTk):
     def _drop_profile_filter(self) -> None:
         self._pg_since = None
         self._pg_until = None
+        self._pg_mode = None
         self.p_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
+        self.p_filter_mode.set("All modes")
         self.p_filter_clear.pack_forget()
         self.p_filter_box.pack_forget()
         self.notify.configure(text="")
@@ -1703,7 +1757,11 @@ class Panel(ctk.CTk):
             start_page = 1
             if self._pg_until:
                 since = (self._pg_until + timedelta(days=1)).isoformat()
-                _, prefix = aoe4world.player_games(pid, 1, since=since)
+                # prefix must be counted within the same mode, or the page offset
+                # would be wrong when a leaderboard filter is also active.
+                _, prefix = aoe4world.player_games(
+                    pid, 1, since=since, leaderboard=self._pg_mode
+                )
                 if prefix:
                     start_page = prefix // 50 + 1
         except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
@@ -1729,7 +1787,9 @@ class Panel(ctk.CTk):
 
     def _profile_worker(self, pid: int, page: int, append: bool) -> None:
         try:
-            games, total = aoe4world.player_games(pid, page, since=self._pg_since)
+            games, total = aoe4world.player_games(
+                pid, page, since=self._pg_since, leaderboard=self._pg_mode
+            )
         except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
             msg = self._api_error_text(exc)
             self.after(0, lambda: self._profile_failed(msg))

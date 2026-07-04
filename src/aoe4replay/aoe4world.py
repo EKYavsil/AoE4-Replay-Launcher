@@ -32,6 +32,14 @@ _RELIC_REPLAY = (
 )
 _UA = "aoe4-replay-launcher"
 
+# Shown for any HTTP 429. Users read this as an app bug, so say plainly it isn't:
+# the server (not the launcher) is throttling their network for too many requests.
+_RATE_LIMIT_MSG = (
+    "This isn't a problem with the launcher — the server temporarily limited your "
+    "network for making too many requests (HTTP 429). Please wait a few minutes and "
+    "try again."
+)
+
 _GAME_ID_RE = re.compile(r"AgeIV_Replay_(\d+)", re.IGNORECASE)
 
 # aoe4world civilization id -> short tag shown in match rows.
@@ -101,7 +109,7 @@ def _get_json(url: str, retries: int = 3, timeout: int = 15, strict: bool = Fals
             if exc.code == 404:
                 return None  # not found is a real (empty) answer, not a failure
             detail = (
-                "aoe4world is rate-limiting requests; wait a moment and try again"
+                _RATE_LIMIT_MSG
                 if exc.code == 429
                 else f"aoe4world returned an error (HTTP {exc.code})"
             )
@@ -382,18 +390,24 @@ def _opponent_of(game: dict, profile_id: int) -> int | None:
 
 
 def player_games(
-    profile_id: int, page: int = 1, since: str | None = None
+    profile_id: int,
+    page: int = 1,
+    since: str | None = None,
+    leaderboard: str | None = None,
 ) -> tuple[list[dict], int | None]:
     """One page (50) of a player's games plus the total game count.
 
     The page already contains full per-game info (players, civs, map, result),
     so no extra call per game is needed. Pages are fetched on demand only.
-    ``since`` (a ``YYYY-MM-DD`` date) filters server-side by ``started_at``,
-    shrinking the total — and thus the number of pages — for a date range.
+    ``since`` (a ``YYYY-MM-DD`` date) and ``leaderboard`` (e.g. ``rm_1v1``,
+    ``qm_ffa``) both filter server-side, shrinking the total — and thus the number
+    of pages — so the page count / total stays correct for either or both filters.
     """
     url = f"{_API}/players/{profile_id}/games?page={page}"
     if since:
         url += f"&since={since}"
+    if leaderboard:
+        url += f"&leaderboard={leaderboard}"
     data = _get_json(url, strict=True)
     games = _extract_items(data)
     total = data.get("total_count") if isinstance(data, dict) else None
@@ -433,19 +447,26 @@ def game_summary(game_id: int, ids: tuple[int, int] | None = None) -> dict | Non
 
 
 def h2h_games(
-    id1: int, id2: int, max_pages: int = 10, limit: int = 50, since: str | None = None
+    id1: int,
+    id2: int,
+    max_pages: int = 10,
+    limit: int = 50,
+    since: str | None = None,
+    leaderboard: str | None = None,
 ) -> list[dict]:
     """All head-to-head games (opposite teams), newest first.
 
-    ``since`` (a ``YYYY-MM-DD`` date) filters server-side by ``started_at``.
+    ``since`` (a ``YYYY-MM-DD`` date) and ``leaderboard`` (e.g. ``rm_1v1``) both
+    filter server-side, shrinking how many pages are fetched.
     """
     raw: list[dict] = []
     page = 1
     since_q = f"&since={since}" if since else ""
+    lb_q = f"&leaderboard={leaderboard}" if leaderboard else ""
     while page <= max_pages:
         url = (
             f"{_API}/players/{id1}/games"
-            f"?opponent_profile_id={id2}&limit={limit}&page={page}{since_q}"
+            f"?opponent_profile_id={id2}&limit={limit}&page={page}{since_q}{lb_q}"
         )
         # First page strict so a failure is reported; later pages best-effort.
         items = _extract_items(_get_json(url, strict=(page == 1)))
@@ -516,10 +537,7 @@ def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
             if exc.code in (404, 410):  # this id genuinely has no replay
                 continue
             if exc.code == 429:  # rate limited — stop now, don't try more perspectives
-                raise RuntimeError(
-                    "The Age of Empires replay server is rate-limiting replay "
-                    "downloads (HTTP 429). Wait a minute and try again."
-                ) from exc
+                raise RuntimeError(_RATE_LIMIT_MSG) from exc
             error = exc  # 5xx etc. — a real error, but a sibling id may still work
             continue
         except Exception as exc:  # noqa: BLE001 - network/timeout, treat as error
