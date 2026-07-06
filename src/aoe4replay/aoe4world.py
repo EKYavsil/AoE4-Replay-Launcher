@@ -30,6 +30,18 @@ _RELIC_REPLAY = (
     "https://api.ageofempires.com/api/GameStats/AgeIV/GetMatchReplay/"
     "?matchId={match_id}&profileId={profile_id}"
 )
+# WorldsEdge community endpoint (primary source): one request returns signed
+# Azure-blob URLs for every available perspective, so the replay itself downloads
+# straight from blob storage and almost nothing touches the rate-limited Relic host
+# above. The signed URLs are short-lived (~6 min), so the list is fetched and the
+# blob downloaded back-to-back in a single operation.
+_WORLDSEDGE_REPLAYS = (
+    "https://aoe-api.worldsedgelink.com/community/leaderboard/getReplayFiles"
+    "?matchIDs=[{match_id}]&title=age4"
+)
+_WE_SUCCESS = 0          # result.code: the replay list was returned
+_WE_NOT_FOUND = 2        # result.code: the match has no replay (deleted / never existed)
+_WE_REPLAY_DATATYPE = 0  # replayFiles[].datatype: the real replay (others are aux files)
 _UA = "aoe4-replay-launcher"
 
 # Shown for any HTTP 429. Users read this as an app bug, so say plainly it isn't:
@@ -41,6 +53,10 @@ _RATE_LIMIT_MSG = (
 )
 
 _GAME_ID_RE = re.compile(r"AgeIV_Replay_(\d+)", re.IGNORECASE)
+# WorldsEdge blob downloads are named ``M_<matchId>_<64-hex-hash>``. The hash holds
+# long digit runs, so the generic trailing-digits fallback would grab a hash
+# fragment instead of the id — match the match id up front.
+_WE_BLOB_RE = re.compile(r"^M_(\d+)_[0-9a-f]{16,}", re.IGNORECASE)
 
 # aoe4world civilization id -> short tag shown in match rows.
 _CIV_ABBREV = {
@@ -100,12 +116,15 @@ def _team_rosters(game: dict) -> list[list[dict]]:
 def game_id_from_name(name: str) -> int | None:
     """Extract the aoe4world game id from a replay filename.
 
-    Matches ``AgeIV_Replay_<id>`` or, for panel downloads named like
-    ``nick1_nick2_25-12-01_<id>.rec``, the trailing run of 7+ digits (the game
-    id; short date fields never reach that length)."""
+    Matches ``AgeIV_Replay_<id>``; the WorldsEdge blob name ``M_<id>_<hash>``; or,
+    for panel downloads like ``nick1_nick2_25-12-01_<id>.rec``, the trailing run of
+    7+ digits (the game id; short date fields never reach that length)."""
     match = _GAME_ID_RE.search(name)
     if match:
         return int(match.group(1))
+    blob = _WE_BLOB_RE.search(name)  # M_<matchId>_<hash> (WorldsEdge download)
+    if blob:
+        return int(blob.group(1))
     runs = re.findall(r"\d{7,}", name)
     return int(runs[-1]) if runs else None
 
@@ -113,6 +132,13 @@ def game_id_from_name(name: str) -> int | None:
 class Aoe4WorldError(Exception):
     """A request to aoe4world failed (network, rate limit, server, bad JSON) — as
     opposed to a request that succeeded and simply returned no results."""
+
+
+class _SourceUnavailable(Exception):
+    """A replay source failed for a reason *other than* a definitive 'no replay'
+    (rate limit, network, or its listed files couldn't be fetched). Signals the
+    caller to try the other source; carries a user-facing message for when every
+    source is exhausted."""
 
 
 def _get_json(url: str, retries: int = 3, timeout: int = 15, strict: bool = False) -> Any | None:
@@ -546,20 +572,97 @@ def _is_replay(data: bytes) -> bool:
     return b"AOE4_RE" in data
 
 
-def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
-    """Download a match replay to ``dest``, trying each participant's perspective.
+def _save_replay(data: bytes, dest: Path) -> None:
+    """Write replay bytes to ``dest`` atomically. The bytes may be gzip or raw —
+    every reader (version, timestamp, playback copy) decompresses transparently —
+    so they are stored as received. The temp-then-rename keeps an interrupted write
+    from half-overwriting a good existing replay with a partial file."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, dest)
 
-    A match's replay may only be reachable from one player's profile, so every
-    unique id in ``profile_ids`` is tried in turn (the displayed players first,
-    then the remaining team members).
+
+def _download_via_worldsedge(match_id: int, dest: Path) -> bool:
+    """Primary source. One metadata request lists signed Azure-blob URLs for every
+    available perspective; the replay then downloads straight from blob storage, so
+    only that single small request touches an API host (a different one from the
+    legacy Relic endpoint, with its own rate budget).
 
     - Returns True if a replay was saved.
-    - Returns False only if every id gave a definitive "no replay" answer (the
-      replay has been deleted).
-    - Raises on request failures. A rate-limit (HTTP 429) stops immediately
-      rather than hammering the remaining perspectives (which would make it worse).
+    - Returns False if the match definitively has no replay (``NOT_FOUND``) — a
+      delete shows on every source, so this is never second-guessed by the caller.
+    - Raises :class:`_SourceUnavailable` if the list can't be fetched or none of the
+      listed blobs download, so the caller can fall back to the legacy endpoint.
     """
-    dest = Path(dest)
+    url = _WORLDSEDGE_REPLAYS.format(match_id=match_id)
+    print(f"[replay {match_id}] primary: WorldsEdge list -> {url}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})  # noqa: S310
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _SourceUnavailable(_RATE_LIMIT_MSG) from exc
+        raise _SourceUnavailable(f"replay list request failed (HTTP {exc.code})") from exc
+    except Exception as exc:  # noqa: BLE001 - network/timeout -> let the caller fall back
+        raise _SourceUnavailable("couldn't reach the replay list service") from exc
+    try:
+        meta = json.loads(payload)
+    except ValueError as exc:
+        raise _SourceUnavailable("replay list response was not valid JSON") from exc
+
+    code = (meta.get("result") or {}).get("code") if isinstance(meta, dict) else None
+    files = meta.get("replayFiles") if isinstance(meta, dict) else None
+    if code == _WE_NOT_FOUND:
+        print(f"[replay {match_id}] WorldsEdge: no replay available (deleted).")
+        return False  # definitive: the match has no replay (deleted / never existed)
+    if code != _WE_SUCCESS or not isinstance(files, list) or not files:
+        raise _SourceUnavailable(f"unexpected replay list response (code {code})")
+
+    # datatype 0 is the real replay (one entry per perspective that kept one); other
+    # datatypes are auxiliary files. Try each real one in listed order, first valid
+    # wins. The list only contains perspectives that actually have a replay, so this
+    # usually succeeds on the first URL — no blind probing of empty perspectives.
+    real = [
+        f for f in files
+        if isinstance(f, dict) and f.get("datatype") == _WE_REPLAY_DATATYPE and f.get("url")
+    ]
+    if not real:
+        raise _SourceUnavailable("replay list had no downloadable replay")
+    print(f"[replay {match_id}] WorldsEdge: {len(real)} perspective(s) available.")
+    last_error: Exception | None = None
+    for entry in real:
+        blob = entry["url"]
+        pid = entry.get("profile_id")
+        print(f"[replay {match_id}] GET blob (profile {pid}) -> {blob.split('?', 1)[0]}")
+        try:
+            req = urllib.request.Request(blob, headers={"User-Agent": _UA})  # noqa: S310
+            with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
+                data = resp.read()
+        except Exception as exc:  # noqa: BLE001 - one blob (expired/hiccup) -> try the next
+            last_error = exc
+            print(f"[replay {match_id}] blob failed ({exc}); trying next perspective…")
+            continue
+        if _is_replay(data):
+            _save_replay(data, dest)
+            print(f"[replay {match_id}] SAVED via WorldsEdge / Azure blob ({len(data)} bytes).")
+            return True
+        # 200 but no AOE4_RE signature (unexpected for a listed file) -> try the next
+    detail = f" ({last_error})" if last_error else ""
+    raise _SourceUnavailable(f"listed replays could not be downloaded{detail}")
+
+
+def _download_via_relic(match_id: int, profile_ids: list[int], dest: Path) -> bool:
+    """Legacy fallback. Probe each participant's perspective on the Age of Empires
+    API — one request per perspective, all on that (rate-limited) host — since a
+    match's replay may only be reachable from one player's profile.
+
+    - Returns True if a replay was saved.
+    - Returns False if every perspective gave a definitive "no replay" answer.
+    - Raises :class:`_SourceUnavailable` on a non-deleted failure (rate limit / net).
+    """
     error: Exception | None = None
     tried: set[int] = set()
     for pid in profile_ids:
@@ -567,6 +670,7 @@ def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
             continue
         tried.add(pid)
         url = replay_url(match_id, pid)
+        print(f"[replay {match_id}] fallback: Relic GET -> {url}")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": _UA})  # noqa: S310
             with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
@@ -574,22 +678,48 @@ def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
         except urllib.error.HTTPError as exc:
             if exc.code in (404, 410):  # this id genuinely has no replay
                 continue
-            if exc.code == 429:  # rate limited — stop now, don't try more perspectives
-                raise RuntimeError(_RATE_LIMIT_MSG) from exc
-            error = exc  # 5xx etc. — a real error, but a sibling id may still work
+            if exc.code == 429:  # rate limited -> stop, don't hammer the rest
+                raise _SourceUnavailable(_RATE_LIMIT_MSG) from exc
+            error = exc  # 5xx etc. -> a real error, but a sibling id may still work
             continue
         except Exception as exc:  # noqa: BLE001 - network/timeout, treat as error
             error = exc
             continue
         if _is_replay(data):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # Write atomically: an interrupted download must never leave a good
-            # existing replay half-overwritten with a partial file.
-            tmp = dest.with_name(dest.name + ".part")
-            tmp.write_bytes(data)
-            os.replace(tmp, dest)
+            _save_replay(data, dest)
+            print(f"[replay {match_id}] SAVED via Relic (profile {pid}).")
             return True
         # HTTP 200 but no AOE4_RE signature -> this id has no real replay
     if error is not None:
-        raise RuntimeError(f"Could not reach the replay server: {error}")
+        raise _SourceUnavailable(f"Could not reach the replay server: {error}")
     return False
+
+
+def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
+    """Download a match replay to ``dest``.
+
+    Tries the WorldsEdge community source first (one metadata call, then a direct
+    Azure-blob download — almost nothing touches the rate-limited Relic host); if
+    that source is unavailable, falls back to probing each perspective on the legacy
+    Relic endpoint.
+
+    - Returns True if a replay was saved.
+    - Returns False if the match genuinely has no replay (deleted). A delete is
+      reflected by both sources, so a definitive "no replay" is not second-guessed:
+      when the primary reports it, the fallback is not consulted.
+    - Raises :class:`RuntimeError` only when every source is unavailable.
+    """
+    dest = Path(dest)
+    try:
+        return _download_via_worldsedge(match_id, dest)
+    except _SourceUnavailable as primary_exc:
+        # Primary is unavailable (not a delete) -> probe perspectives on the legacy API.
+        print(f"[replay {match_id}] WorldsEdge unavailable ({primary_exc}); falling back to Relic.")
+        try:
+            return _download_via_relic(match_id, profile_ids, dest)
+        except _SourceUnavailable as fallback_exc:
+            # Every source is exhausted (both rate-limited, or offline). Prefer the
+            # actionable rate-limit note if either source hit it.
+            reasons = (str(primary_exc), str(fallback_exc))
+            message = _RATE_LIMIT_MSG if _RATE_LIMIT_MSG in reasons else str(fallback_exc)
+            raise RuntimeError(message) from fallback_exc

@@ -114,6 +114,8 @@ def verify_sizes(records: list[ManifestRecord], target_dir: Path) -> bool:
     for record in records:
         if record.chunks == 0:
             continue
+        if str(record.path).lower().endswith(".log"):
+            continue  # a runtime log (the game rewrites it on launch); its size drifts
         path = target_dir / record.path
         try:
             if path.stat().st_size != record.size:

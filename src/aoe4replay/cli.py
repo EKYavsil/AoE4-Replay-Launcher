@@ -221,7 +221,9 @@ def panel(config_path: ConfigOpt = None) -> None:
     """Open the replay download/launch panel (GUI)."""
     from . import panel as panel_module
 
-    panel_module.run(_load(config_path))
+    cfg = _load(config_path)
+    print(f"Data root: {cfg.project_root}  |  store: {cfg.repo}")  # which data the panel uses
+    panel_module.run(cfg)
 
 
 _GITHUB_REPO_URL = "https://github.com/EKYavsil/AoE4-Replay-Launcher"

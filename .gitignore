@@ -9,6 +9,8 @@
 # --- local, machine-specific config (may contain your Steam username) ---
 config.local.toml
 config.toml
+# local, machine-specific dev launcher script
+run-panel.bat
 
 # --- restic repository password (auto-generated; losing it makes the repo unreadable) ---
 .restic-password

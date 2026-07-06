@@ -686,6 +686,14 @@ def _build_is_ready(
     return False
 
 
+def _is_runtime_log(path: str) -> bool:
+    """A ``.log`` the game rewrites on launch (e.g. ``Aegis_RelicCardinal.log``). Its
+    exact bytes are irrelevant to playback and its size legitimately drifts between
+    the depot manifest, the live install and the store, so a size mismatch on such a
+    file must not block reconstruction."""
+    return str(path).lower().endswith(".log")
+
+
 def _reconstruct_build(
     cfg: Config,
     build: buildmap.Build,
@@ -747,11 +755,20 @@ def _reconstruct_build(
                 # cleanly; if a missing file slipped through, compose would silently
                 # fall back to the live install's wrong same-name file. Refuse loudly.
                 if not src.is_file() or src.stat().st_size != record.size:
-                    raise RuntimeError(
-                        f"Restore from the store failed for {record.path!r} "
-                        f"(missing or wrong size). The store snapshot may be "
-                        f"incomplete; refusing to assemble a build from wrong files."
-                    )
+                    # ...except a runtime log, whose size drifts and which the game
+                    # rewrites anyway: use whatever we have (the restored copy, else
+                    # the live install's), and skip it entirely if neither exists.
+                    if not _is_runtime_log(record.path):
+                        raise RuntimeError(
+                            f"Restore from the store failed for {record.path!r} "
+                            f"(missing or wrong size). The store snapshot may be "
+                            f"incomplete; refusing to assemble a build from wrong files."
+                        )
+                    if not src.is_file():
+                        live = cfg.steam_install / record.path
+                        if not live.is_file():
+                            continue  # nothing to place; the game recreates the log
+                        src = live
                 target = reuse_dir / record.path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 compose.link_or_copy(src, target)

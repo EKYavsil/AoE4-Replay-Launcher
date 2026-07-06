@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .config import Config
@@ -284,9 +284,15 @@ class Panel(ctk.CTk):
 
         self._searching = False
         self._playing = False
+        self._downloading = False  # a replay download is running -> block a second
         self._cancel_event: threading.Event | None = None  # set while a download runs
         self._play_buttons: list[ctk.CTkButton] = []
-        self._info_cache: dict[int, dict] = {}  # game_id -> match summary
+        self._dl_buttons: list[ctk.CTkButton] = []  # every list row's Download button
+        self._stamp_cache: dict[tuple, datetime] = {}  # (path, mtime, size) -> replay time
+        self._info_cache: dict[int, dict] = self._load_match_info()  # persisted across runs
+        # scrolling any list dismisses an open roster tooltip — a prime way it could
+        # otherwise be stranded (a canvas scroll doesn't fire <Leave> on the moved name)
+        self.bind_all("<MouseWheel>", lambda _e: self._hide_roster_tip(), add="+")
         self._images: dict[tuple[str, tuple[int, int]], ctk.CTkImage] = {}
         self._country_sources: dict[str, Image.Image] = {}
         self._country_images: dict[str, ctk.CTkImage] = {}
@@ -1362,28 +1368,40 @@ class Panel(ctk.CTk):
         tip.deiconify()
         tip.lift()
         self._roster_tip_src = widget
+        self._roster_tip_deadline = time.monotonic() + 15.0  # last-resort auto-hide cap
         if getattr(self, "_roster_tip_poll", None) is None:
-            self._roster_tip_poll = self.after(150, self._poll_roster_tip)
+            self._roster_tip_poll = self.after(120, self._poll_roster_tip)
+
+    def _pointer_over_src(self) -> bool:
+        """True only if the pointer is over the source name — or one of its internal
+        child widgets: a CTkLabel is a composite, so winfo_containing returns an inner
+        tk widget, not the CTkLabel object (checking ``is widget`` would always fail
+        and flicker the tip away). Tk hit-testing respects scroll-clipping, DPI and
+        multi-monitor layouts, unlike manual rootx/width bounds math."""
+        widget = getattr(self, "_roster_tip_src", None)
+        try:
+            if widget is None or not widget.winfo_exists():
+                return False
+            under = self.winfo_containing(*self.winfo_pointerxy())
+            if under is None:
+                return False
+            wpath, upath = str(widget), str(under)
+            return upath == wpath or upath.startswith(wpath + ".")
+        except Exception:  # noqa: BLE001 - any Tk hiccup -> treat as "not over" (hide)
+            return False
 
     def _poll_roster_tip(self) -> None:
         """Safety net for a missed <Leave>: hide once the pointer is no longer over
-        the source name (or that name is gone / the tip is already hidden)."""
+        the source name. A hard deadline is the last resort if even this is fooled."""
         self._roster_tip_poll = None
         tip = getattr(self, "_roster_tip", None)
-        widget = getattr(self, "_roster_tip_src", None)
         if tip is None or not tip.winfo_exists() or not tip.winfo_viewable():
             return  # already hidden — stop polling until the next show
-        over = False
-        with contextlib.suppress(Exception):
-            px, py = self.winfo_pointerxy()
-            wx, wy = widget.winfo_rootx(), widget.winfo_rooty()
-            over = (
-                widget.winfo_exists()
-                and wx <= px <= wx + widget.winfo_width()
-                and wy <= py <= wy + widget.winfo_height()
-            )
-        if over:
-            self._roster_tip_poll = self.after(150, self._poll_roster_tip)
+        if time.monotonic() >= getattr(self, "_roster_tip_deadline", 0.0):
+            self._hide_roster_tip()  # absolute cap — never linger past the deadline
+            return
+        if self._pointer_over_src():
+            self._roster_tip_poll = self.after(120, self._poll_roster_tip)
         else:
             self._hide_roster_tip()
 
@@ -1414,6 +1432,9 @@ class Panel(ctk.CTk):
         btn = self._accent_button(row, f"{ICON_DL}  Download", 126, command=lambda: None)
         btn.configure(command=lambda s=summary, b=btn, w=warning: self._download(s, b, w))
         btn.pack(side="right", padx=10, pady=8)
+        self._dl_buttons.append(btn)  # so a running download can disable every button
+        if self._downloading:  # a download is in progress -> a fresh row starts disabled too
+            btn.configure(state="disabled")
         self._matchup(row, summary).pack(side="left", fill="x", expand=True, padx=(4, 8))
 
     # ---- profile resolution (id directly, or pick from name suggestions) ---
@@ -1943,7 +1964,23 @@ class Panel(ctk.CTk):
 
     # ---- download ---------------------------------------------------------
 
+    def _set_downloads_enabled(self, enabled: bool) -> None:
+        """Enable/disable every list Download button — one download runs at a time.
+        Dead buttons from rebuilt rows are pruned; a finished 'Downloaded ✓' button
+        stays disabled so it can't re-trigger a download."""
+        self._dl_buttons = [b for b in self._dl_buttons if b.winfo_exists()]
+        for b in self._dl_buttons:
+            with contextlib.suppress(Exception):
+                if not enabled:
+                    b.configure(state="disabled")
+                elif ICON_CHECK not in b.cget("text"):
+                    b.configure(state="normal")
+
     def _download(self, summary: dict, btn: ctk.CTkButton, warning: ctk.CTkLabel) -> None:
+        if self._downloading:  # one replay at a time -> ignore a second click
+            return
+        self._downloading = True
+        self._set_downloads_enabled(False)  # disable every Download button while this runs
         btn.configure(state="disabled", text="Downloading…")
         game_id = summary["game_id"]
         dest = self.cfg.downloads_dir / f"AgeIV_Replay_{game_id}.rec"
@@ -1968,16 +2005,19 @@ class Panel(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _download_done(self, btn: ctk.CTkButton, ok: bool, warning: ctk.CTkLabel) -> None:
+        self._downloading = False
         # the button/row may have been rebuilt (new search/reset) during the download
         if ok:
             with contextlib.suppress(Exception):
                 btn.configure(text=f"Downloaded {ICON_CHECK}", state="disabled")
             warning.configure(text="")  # a successful download clears any prior warning
+            self._save_match_info()  # persist the summary (set by the worker) across runs
             self.refresh_downloads()
         else:
             with contextlib.suppress(Exception):
                 btn.destroy()
             self._show_deleted_warning(warning)
+        self._set_downloads_enabled(True)  # re-enable the rest (a finished one stays disabled)
 
     def _show_deleted_warning(self, warning: ctk.CTkLabel) -> None:
         # clear first so a repeat failure visibly re-appears (re-written, not stale)
@@ -1988,8 +2028,10 @@ class Panel(ctk.CTk):
             )
 
     def _download_error(self, btn: ctk.CTkButton, message: str) -> None:
+        self._downloading = False
         with contextlib.suppress(Exception):
             btn.configure(text=f"{ICON_DL}  Download", state="normal")
+        self._set_downloads_enabled(True)
         self._error("Download failed", message)
 
     # ---- downloaded list + play ------------------------------------------
@@ -2052,12 +2094,34 @@ class Panel(ctk.CTk):
             else:
                 self._error("Import failed", detail)
 
+    def _replay_order_key(self, path: Path) -> datetime:
+        """Chronological sort key: the replay's own recorded time, so a manually added
+        replay slots in by its match date instead of jumping to the top by filename.
+        Cached per (path, mtime, size) so repeated refreshes don't re-read files;
+        falls back to the file's mtime when the embedded timestamp can't be read."""
+        try:
+            st = path.stat()
+        except OSError:
+            return datetime.min
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        cached = self._stamp_cache.get(key)
+        if cached is not None:
+            return cached
+        stamp = replay.read_timestamp_optional(path)
+        value = stamp.value if stamp is not None else datetime.fromtimestamp(st.st_mtime)
+        self._stamp_cache[key] = value
+        return value
+
     def refresh_downloads(self) -> None:
         for child in self.downloads.winfo_children():
             child.destroy()
         self._play_buttons.clear()
         folder = self.cfg.downloads_dir
-        files = sorted(folder.glob("*.rec"), reverse=True) if folder.exists() else []
+        files = (
+            sorted(folder.glob("*.rec"), key=self._replay_order_key, reverse=True)
+            if folder.exists() else []
+        )
+        self._prune_match_info(files)  # forget replays deleted in-app or manually
         context = self._load_search_context()  # game_id -> [searched_id, opponent_id]
         if not files:
             ctk.CTkLabel(
@@ -2162,15 +2226,78 @@ class Panel(ctk.CTk):
                 return data
         return {}
 
-    def _save_search_context(self, game_id: int, id1: int, id2: int) -> None:
+    def _write_search_context(self, data: dict) -> None:
         with contextlib.suppress(Exception):
             path = self._search_context_path()
-            data = self._load_search_context()
-            data[str(game_id)] = [int(id1), int(id2)]
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
             os.replace(tmp, path)
+
+    def _save_search_context(self, game_id: int, id1: int, id2: int) -> None:
+        data = self._load_search_context()
+        data[str(game_id)] = [int(id1), int(id2)]
+        self._write_search_context(data)
+
+    # --- match-info cache: a match summary is static once the match is over, so we
+    # persist it and reuse it across runs — no per-replay API call on startup. An
+    # entry is dropped when its replay file is gone (deleted in-app or manually).
+    # All writes run on the UI thread, so concurrent fetches never clash. ----------
+
+    def _match_info_path(self) -> Path:
+        return self.cfg.downloads_dir / ".match-info.json"
+
+    @staticmethod
+    def _encode_summary(summary: dict) -> dict:
+        d = dict(summary)
+        started = d.get("started_at")
+        d["started_at"] = started.isoformat() if isinstance(started, datetime) else None
+        return d
+
+    @staticmethod
+    def _decode_summary(d: dict) -> dict:
+        d = dict(d)
+        started = d.get("started_at")
+        d["started_at"] = None
+        if isinstance(started, str):
+            with contextlib.suppress(ValueError):
+                d["started_at"] = datetime.fromisoformat(started)
+        return d
+
+    def _load_match_info(self) -> dict[int, dict]:
+        with contextlib.suppress(Exception):
+            raw = json.loads(self._match_info_path().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {
+                    int(k): self._decode_summary(v)
+                    for k, v in raw.items() if k.isdigit() and isinstance(v, dict)
+                }
+        return {}
+
+    def _save_match_info(self) -> None:
+        with contextlib.suppress(Exception):
+            path = self._match_info_path()
+            # snapshot the dict (a concurrent fetch may mutate it) before serialising
+            data = {str(g): self._encode_summary(s) for g, s in list(self._info_cache.items())}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+
+    def _prune_match_info(self, files: list[Path]) -> None:
+        """Drop cached info + search context for replays whose file is gone, so
+        deleting a replay (in-app or manually) drops its stored info too."""
+        alive = {aoe4world.game_id_from_name(p.name) for p in files}
+        alive.discard(None)
+        stale = [g for g in list(self._info_cache) if g not in alive]
+        if stale:
+            for g in stale:
+                self._info_cache.pop(g, None)
+            self._save_match_info()
+        ctx = self._load_search_context()
+        kept = {k: v for k, v in ctx.items() if not (k.isdigit() and int(k) not in alive)}
+        if len(kept) != len(ctx):
+            self._write_search_context(kept)
 
     def _fetch_info(
         self, game_id: int, label: ctk.CTkLabel, ids: tuple[int, int] | None = None
@@ -2184,6 +2311,7 @@ class Panel(ctk.CTk):
             # the row may have been rebuilt since the fetch started
             with contextlib.suppress(Exception):
                 self._render_download_summary(label.master, summary)
+            self._save_match_info()  # persist so this replay isn't refetched next run
 
         self.after(0, update)
 
