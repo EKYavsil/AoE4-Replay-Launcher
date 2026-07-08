@@ -327,20 +327,6 @@ def _team_index(game: dict) -> dict[int, int]:
     return out
 
 
-def are_opponents(game: dict, id1: int, id2: int) -> bool:
-    """True if the two profiles played on opposite teams in this game."""
-    team_of = _team_index(game)
-    if id1 in team_of and id2 in team_of:
-        return team_of[id1] != team_of[id2]
-    players = game.get("players")
-    if isinstance(players, list):
-        results = {p.get("profile_id"): p.get("result") for p in players}
-        r1, r2 = results.get(id1), results.get(id2)
-        if r1 and r2:
-            return {r1, r2} == {"win", "loss"}
-    return False
-
-
 def _player_field(game: dict, profile_id: int, field: str) -> Any | None:
     teams = game.get("teams") or []
     if isinstance(teams, list):
@@ -458,20 +444,23 @@ def player_games(
     page: int = 1,
     since: str | None = None,
     leaderboard: str | None = None,
+    opponent: int | None = None,
 ) -> tuple[list[dict], int | None]:
     """One page (50) of a player's games plus the total game count.
 
     The page already contains full per-game info (players, civs, map, result),
     so no extra call per game is needed. Pages are fetched on demand only.
-    ``since`` (a ``YYYY-MM-DD`` date) and ``leaderboard`` (e.g. ``rm_1v1``,
-    ``qm_ffa``) both filter server-side, shrinking the total — and thus the number
-    of pages — so the page count / total stays correct for either or both filters.
+    ``since`` (a ``YYYY-MM-DD`` date), ``leaderboard`` (e.g. ``rm_1v1``, ``qm_ffa``)
+    and ``opponent`` (a profile id — restricts to head-to-head games vs that player)
+    all filter server-side, so the page count / total stays correct for any of them.
     """
     url = f"{_API}/players/{profile_id}/games?page={page}"
     if since:
         url += f"&since={since}"
     if leaderboard:
         url += f"&leaderboard={leaderboard}"
+    if opponent:
+        url += f"&opponent_profile_id={opponent}"
     data = _get_json(url, strict=True)
     games = _extract_items(data)
     total = data.get("total_count") if isinstance(data, dict) else None
@@ -508,52 +497,6 @@ def game_summary(game_id: int, ids: tuple[int, int] | None = None) -> dict | Non
     summary = match_summary(data, pair[0], pair[1])
     summary["_id1"], summary["_id2"] = pair[0], pair[1]
     return summary
-
-
-def h2h_games(
-    id1: int,
-    id2: int,
-    max_pages: int = 10,
-    limit: int = 50,
-    since: str | None = None,
-    leaderboard: str | None = None,
-) -> list[dict]:
-    """All head-to-head games (opposite teams), newest first.
-
-    ``since`` (a ``YYYY-MM-DD`` date) and ``leaderboard`` (e.g. ``rm_1v1``) both
-    filter server-side, shrinking how many pages are fetched.
-    """
-    raw: list[dict] = []
-    page = 1
-    since_q = f"&since={since}" if since else ""
-    lb_q = f"&leaderboard={leaderboard}" if leaderboard else ""
-    while page <= max_pages:
-        url = (
-            f"{_API}/players/{id1}/games"
-            f"?opponent_profile_id={id2}&limit={limit}&page={page}{since_q}{lb_q}"
-        )
-        # First page strict so a failure is reported; later pages best-effort.
-        items = _extract_items(_get_json(url, strict=(page == 1)))
-        if not items:
-            break
-        raw.extend(items)
-        if len(items) < limit:
-            break
-        page += 1
-
-    seen: set = set()
-    uniq: list[dict] = []
-    for game in raw:
-        key = _game_id(game) or (game.get("kind"), game.get("started_at"))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(game)
-
-    uniq.sort(
-        key=lambda g: _parse_iso(g.get("started_at")) or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
-    return [g for g in uniq if are_opponents(g, id1, id2)]
 
 
 def replay_url(match_id: int, profile_id: int) -> str:

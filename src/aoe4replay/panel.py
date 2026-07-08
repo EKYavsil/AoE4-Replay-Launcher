@@ -287,6 +287,8 @@ class Panel(ctk.CTk):
         self._downloading = False  # a replay download is running -> block a second
         self._cancel_event: threading.Event | None = None  # set while a download runs
         self._play_buttons: list[ctk.CTkButton] = []
+        self._dl_files: list[Path] = []  # all downloaded replays, newest-first (paged)
+        self._dl_page = 1  # currently shown page of the downloaded-replays list
         self._dl_buttons: list[ctk.CTkButton] = []  # every list row's Download button
         self._stamp_cache: dict[tuple, datetime] = {}  # (path, mtime, size) -> replay time
         self._info_cache: dict[int, dict] = self._load_match_info()  # persisted across runs
@@ -301,18 +303,28 @@ class Panel(ctk.CTk):
         self._active_tab = "Profile games"
         # profile-games tab paging state
         self._pg_profile: int | None = None
-        self._pg_page = 0
+        self._pg_page = 0  # currently displayed page
+        self._pg_start_page = 1  # first page of the view (date-jump aware); Prev stops here
         self._pg_total: int | None = None
-        self._pg_loaded = 0
+        # page-navigation cache: page -> (summaries, raw_count). Only the current
+        # page's cards ever exist on screen (widgets are the scarce resource; the
+        # summary data is cheap), which keeps Windows handle use bounded.
+        self._pg_page_cache: dict[int, tuple[list[dict], int]] = {}
         self._pg_searching = False
         self._pg_since: str | None = None  # API server-side lower bound (YYYY-MM-DD)
         self._pg_until: date | None = None  # client-side upper bound
         self._pg_mode: str | None = None  # server-side leaderboard filter (rm_1v1, qm_ffa, …)
         self._h2h_ids: tuple[int, int] | None = None
+        self._h2h_page = 0  # currently displayed h2h page
+        self._h2h_start_page = 1
+        self._h2h_total: int | None = None
+        self._h2h_page_cache: dict[int, tuple[list[dict], int]] = {}
         self._h2h_since: str | None = None
         self._h2h_until: date | None = None
         self._h2h_mode: str | None = None  # server-side leaderboard filter
         self._split_initialized = False
+        self._split_last_height = 0  # previous tick's splitter height (settle check)
+        self._split_attempts = 0  # safety cap so a never-settling size still places
         self._grip_drag_offset = 0
         self._grip_target_y = 0
 
@@ -805,6 +817,10 @@ class Panel(ctk.CTk):
             font=self.font_bold,
             command=self._import_replay,
         ).pack(side="left")
+        self.dl_count_label = ctk.CTkLabel(
+            dl_header, text="", text_color=MUTED, font=self.font_bold
+        )
+        self.dl_count_label.pack(side="left", padx=(12, 0))
 
         self.downloads = ctk.CTkScrollableFrame(
             self.download_pane,
@@ -815,6 +831,26 @@ class Panel(ctk.CTk):
             label_font=self.font_head,
         )
         self.downloads.pack(fill="both", expand=True)
+        # Page navigation for the downloaded list, mirroring the search tabs: at most
+        # one page (50) of rows is built at a time so the widget/handle count stays
+        # bounded. Sits fixed below the scroll area (only shown past 50 replays).
+        self.dl_pager = ctk.CTkFrame(self.download_pane, fg_color="transparent")
+        self.dl_pager_prev = ctk.CTkButton(
+            self.dl_pager, text="◀  Prev", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_dl_prev_page,
+        )
+        self.dl_pager_prev.pack(side="left", padx=(0, 6))
+        self.dl_pager_label = ctk.CTkLabel(
+            self.dl_pager, text="", text_color=MUTED, font=self.font_bold, width=90
+        )
+        self.dl_pager_label.pack(side="left", padx=4)
+        self.dl_pager_next = ctk.CTkButton(
+            self.dl_pager, text="Next  ▶", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_dl_next_page,
+        )
+        self.dl_pager_next.pack(side="left", padx=(6, 0))
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.pack(fill="x", padx=18, pady=(0, 6))
         ctk.CTkLabel(
@@ -833,11 +869,17 @@ class Panel(ctk.CTk):
 
     def _set_initial_split(self) -> None:
         self.update_idletasks()
-        height = self.splitter.winfo_height()
         if self._split_initialized:
             self._position_split_grip()
             return
-        if height <= 100:
+        height = self.splitter.winfo_height()
+        prev, self._split_last_height = self._split_last_height, height
+        self._split_attempts += 1
+        # Only place the sash once the pane has a real, *settled* height (unchanged
+        # since the last 100ms tick). Placing mid-layout at a small transitional
+        # height lets the min-size clamps + stretch redistribution land bottom-heavy
+        # (the rare "inverted" open). The attempt cap still places if it never settles.
+        if height <= 100 or (height != prev and self._split_attempts < 15):
             self.after(100, self._set_initial_split)
             return
         self.splitter.sash_place(0, 0, int(height * 0.70))
@@ -1170,6 +1212,15 @@ class Panel(ctk.CTk):
             top, f"{ICON_SEARCH}  Search", 110, self.on_profile_search
         )
         self.p_search_btn.pack(side="left", padx=(0, 8), pady=4)
+        # far-right refresh: reload the current profile from page 1 with a fresh API
+        # call (e.g. a just-finished match whose replay is still on its way in).
+        self.p_refresh_btn = ctk.CTkButton(
+            top, text=ICON_RELOAD, width=44, height=38, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
+            font=ctk.CTkFont(size=26, weight="bold"),  # 2x icon, button size unchanged
+            command=self._refresh_profile,
+        )
+        self.p_refresh_btn.pack(side="right", padx=(0, 6), pady=4)
         self.p_filter_box, self.p_filter_btn, self.p_filter_clear, self.p_filter_mode = (
             self._make_filter_box(
                 top, self._open_profile_filter, self._reset_profile, self._apply_profile_mode
@@ -1189,16 +1240,25 @@ class Panel(ctk.CTk):
             label_font=self.font_head,
         )
         self.games.pack(fill="both", expand=True, padx=4, pady=6)
-        self.load_more_btn = ctk.CTkButton(
-            parent,
-            text=f"{ICON_RELOAD}  Load more",
-            height=36,
-            corner_radius=8,
-            fg_color=NEUTRAL,
-            hover_color=NEUTRAL_HOVER,
-            font=self.font_bold,
-            command=self.on_load_more,
+        # Page navigation (replaces "Load more"): only one page of cards is on screen
+        # at a time, so the widget/handle count stays bounded no matter how deep you go.
+        self.pager = ctk.CTkFrame(parent, fg_color="transparent")
+        self.pager_prev = ctk.CTkButton(
+            self.pager, text="◀  Prev", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_prev_page,
         )
+        self.pager_prev.pack(side="left", padx=(0, 6))
+        self.pager_label = ctk.CTkLabel(
+            self.pager, text="", text_color=MUTED, font=self.font_bold, width=90
+        )
+        self.pager_label.pack(side="left", padx=4)
+        self.pager_next = ctk.CTkButton(
+            self.pager, text="Next  ▶", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_next_page,
+        )
+        self.pager_next.pack(side="left", padx=(6, 0))
 
     def _build_h2h_tab(self, parent: ctk.CTkFrame) -> None:
         top = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1224,6 +1284,25 @@ class Panel(ctk.CTk):
             label_font=self.font_head,
         )
         self.matches.pack(fill="both", expand=True, padx=4, pady=6)
+        # Page navigation for head-to-head, mirroring the profile tab: one page of
+        # cards on screen at a time keeps the widget/handle count bounded.
+        self.h_pager = ctk.CTkFrame(parent, fg_color="transparent")
+        self.h_pager_prev = ctk.CTkButton(
+            self.h_pager, text="◀  Prev", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_h2h_prev_page,
+        )
+        self.h_pager_prev.pack(side="left", padx=(0, 6))
+        self.h_pager_label = ctk.CTkLabel(
+            self.h_pager, text="", text_color=MUTED, font=self.font_bold, width=90
+        )
+        self.h_pager_label.pack(side="left", padx=4)
+        self.h_pager_next = ctk.CTkButton(
+            self.h_pager, text="Next  ▶", width=96, height=36, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, font=self.font_bold,
+            command=self.on_h2h_next_page,
+        )
+        self.h_pager_next.pack(side="left", padx=(6, 0))
 
     # ---- row cards --------------------------------------------------------
 
@@ -1465,12 +1544,16 @@ class Panel(ctk.CTk):
 
     def _h2h_failed(self, message: str) -> None:
         self._set_h2h_busy(False)
+        with contextlib.suppress(Exception):
+            self.h_pager_prev.configure(state="normal")
+            self.h_pager_next.configure(state="normal")
         self.status.configure(text=message)
 
     def _profile_failed(self, message: str) -> None:
         self._set_profile_busy(False)
         with contextlib.suppress(Exception):
-            self.load_more_btn.configure(state="normal")
+            self.pager_prev.configure(state="normal")
+            self.pager_next.configure(state="normal")
         self.p_status.configure(text=message)
 
     def _suggest_worker(
@@ -1606,10 +1689,13 @@ class Panel(ctk.CTk):
         self._h2h_since = None
         self._h2h_until = None
         self._h2h_mode = None
+        self._h2h_start_page = 1
+        self._h2h_page_cache = {}
         self.h_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
         self.h_filter_mode.set("All modes")
         self.h_filter_clear.pack_forget()
         self.h_filter_box.pack_forget()
+        self.h_pager.pack_forget()
         self.notify.configure(text="")
 
     def _h2h_resolve(self, v1: str, v2: str) -> None:
@@ -1658,16 +1744,75 @@ class Panel(ctk.CTk):
 
     def _start_h2h(self, id1: int, id2: int) -> None:
         self._h2h_ids = (id1, id2)
+        self._h2h_page = 0
+        self._h2h_start_page = 1
+        self._h2h_total = None
+        self._h2h_page_cache = {}
         self._set_h2h_busy(True)
         for child in self.matches.winfo_children():
             child.destroy()
+        self.h_pager.pack_forget()
+        # the date/mode filter becomes available once a search is running
+        self.h_filter_box.pack(side="left", padx=(0, 6), pady=4)
         self.status.configure(text="Searching…")
-        threading.Thread(target=self._search_worker, args=(id1, id2), daemon=True).start()
+        threading.Thread(target=self._h2h_page_begin, args=(id1, id2), daemon=True).start()
 
-    def _search_worker(self, id1: int, id2: int) -> None:
+    def _h2h_page_begin(self, id1: int, id2: int) -> None:
+        """Load the first h2h page; jump straight to the [from, to] window's start
+        when an upper-bound date filter is set (the API has no 'until')."""
         try:
-            games = aoe4world.h2h_games(
-                id1, id2, since=self._h2h_since, leaderboard=self._h2h_mode
+            start_page = 1
+            if self._h2h_until:
+                since = (self._h2h_until + timedelta(days=1)).isoformat()
+                _, prefix = aoe4world.player_games(
+                    id1, 1, since=since, leaderboard=self._h2h_mode, opponent=id2
+                )
+                if prefix:
+                    start_page = prefix // 50 + 1
+        except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
+            msg = self._api_error_text(exc)
+            self.after(0, lambda: self._h2h_failed(msg))
+            return
+        self._h2h_start_page = start_page
+        self._h2h_page_cache = {}
+        self._h2h_worker(id1, id2, start_page)
+
+    def on_h2h_prev_page(self) -> None:
+        if self._searching or self._h2h_ids is None or self._h2h_page <= self._h2h_start_page:
+            return
+        self._lock_h2h_pager()  # lock now, before any await -> no rapid double-fire
+        self._h2h_go_to_page(self._h2h_page - 1)
+
+    def on_h2h_next_page(self) -> None:
+        if self._searching or self._h2h_ids is None:
+            return
+        _, raw_count = self._h2h_page_cache.get(self._h2h_page, ([], 0))
+        if raw_count < 50:  # last page -> nothing more to load
+            return
+        self._lock_h2h_pager()
+        self._h2h_go_to_page(self._h2h_page + 1)
+
+    def _lock_h2h_pager(self) -> None:
+        """Mark busy and disable the h2h pager immediately, so a rapidly repeated
+        click can't queue a second fetch. _h2h_render_page unlocks once shown."""
+        self._set_h2h_busy(True)  # _searching=True + Search disabled
+        self.h_pager_prev.configure(state="disabled")
+        self.h_pager_next.configure(state="disabled")
+
+    def _h2h_go_to_page(self, page: int) -> None:
+        if page in self._h2h_page_cache:
+            self._h2h_render_page(page)
+            return
+        if self._h2h_ids is None:
+            return
+        self.status.configure(text="Searching…")  # pager already locked by the caller
+        id1, id2 = self._h2h_ids
+        threading.Thread(target=self._h2h_worker, args=(id1, id2, page), daemon=True).start()
+
+    def _h2h_worker(self, id1: int, id2: int, page: int) -> None:
+        try:
+            games, total = aoe4world.player_games(
+                id1, page, since=self._h2h_since, leaderboard=self._h2h_mode, opponent=id2
             )
         except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
             msg = self._api_error_text(exc)
@@ -1686,18 +1831,34 @@ class Panel(ctk.CTk):
                 p for p in aoe4world._player_ids(game) if p not in (id1, id2)
             ]
             summaries.append(s)
-        self.after(0, lambda: self._show_matches(summaries))
+        self._h2h_page_cache[page] = (summaries, len(games))
+        self._h2h_total = total
+        self.after(0, lambda: self._h2h_render_page(page))
 
-    def _show_matches(self, summaries: list[dict]) -> None:
+    def _h2h_render_page(self, page: int) -> None:
         self._set_h2h_busy(False)
-        self.status.configure(
-            text=f"{len(summaries)} match(es)." if summaries else "No matches found."
-        )
+        self._h2h_page = page
+        summaries, raw_count = self._h2h_page_cache.get(page, ([], 0))
+        self._hide_roster_tip()  # a page swap destroys the cards; drop any open hover first
+        for child in self.matches.winfo_children():
+            child.destroy()
         for summary in summaries:
             self._game_card(self.matches, summary)
-        # the date filter becomes available once matches are listed
-        self.h_filter_box.pack(side="left", padx=(0, 6), pady=4)
         self.after(0, lambda: self._scroll_to_top(self.matches))
+        count = len(summaries)
+        self.status.configure(text=f"{count} match(es)." if count else "No matches found.")
+        self._h2h_update_pager(page, raw_count)
+
+    def _h2h_update_pager(self, page: int, raw_count: int) -> None:
+        has_prev = page > self._h2h_start_page
+        has_next = raw_count >= 50  # a full page means more remain
+        self.h_pager_label.configure(text=f"Page {page - self._h2h_start_page + 1}")
+        self.h_pager_prev.configure(state="normal" if has_prev else "disabled")
+        self.h_pager_next.configure(state="normal" if has_next else "disabled")
+        if has_prev or has_next:
+            self.h_pager.pack(pady=(0, 6))
+        else:
+            self.h_pager.pack_forget()
 
     # ---- date-range filter (calendar) -------------------------------------
 
@@ -1761,14 +1922,15 @@ class Panel(ctk.CTk):
         self._pg_until = None
         self._pg_mode = None
         self._pg_page = 0
+        self._pg_start_page = 1
         self._pg_total = None
-        self._pg_loaded = 0
+        self._pg_page_cache = {}
         self.p_entry.delete(0, "end")
         self.p_filter_btn.configure(text=f"{ICON_CAL}  Date filter")
         self.p_filter_mode.set("All modes")
         self.p_filter_clear.pack_forget()
         self.p_filter_box.pack_forget()
-        self.load_more_btn.pack_forget()
+        self.pager.pack_forget()
         for child in self.games.winfo_children():
             child.destroy()
         self.p_status.configure(text="")
@@ -1795,6 +1957,10 @@ class Panel(ctk.CTk):
     def _reset_h2h(self) -> None:
         """✕ resets the tab's top to its initial (just-opened) state."""
         self._h2h_ids = None
+        self._h2h_page = 0
+        self._h2h_start_page = 1
+        self._h2h_total = None
+        self._h2h_page_cache = {}
         self._h2h_since = None
         self._h2h_until = None
         self._h2h_mode = None
@@ -1804,6 +1970,7 @@ class Panel(ctk.CTk):
         self.h_filter_mode.set("All modes")
         self.h_filter_clear.pack_forget()
         self.h_filter_box.pack_forget()
+        self.h_pager.pack_forget()
         for child in self.matches.winfo_children():
             child.destroy()
         self.status.configure(text="")
@@ -1845,7 +2012,7 @@ class Panel(ctk.CTk):
             return
         # a name (or a numeric non-profile) -> pick one inline (Search re-enables
         # once the list is shown), then list its games.
-        self.load_more_btn.pack_forget()
+        self.pager.pack_forget()
         self._suggest(
             resolved, self.games, self.p_status, self.p_entry,
             after_pick=self._start_profile,
@@ -1857,11 +2024,12 @@ class Panel(ctk.CTk):
         self.p_entry.insert(0, str(pid))
         self._pg_profile = pid
         self._pg_page = 0
+        self._pg_start_page = 1
         self._pg_total = None
-        self._pg_loaded = 0
+        self._pg_page_cache = {}
         for child in self.games.winfo_children():
             child.destroy()
-        self.load_more_btn.pack_forget()
+        self.pager.pack_forget()
         # the date filter becomes available once a player is selected
         self.p_filter_box.pack(side="left", padx=(0, 6), pady=4, before=self.p_status)
         self._set_profile_busy(True)
@@ -1869,9 +2037,9 @@ class Panel(ctk.CTk):
         threading.Thread(target=self._profile_begin, args=(pid,), daemon=True).start()
 
     def _profile_begin(self, pid: int) -> None:
-        """First page of a profile. With an upper bound the API can't express,
-        jump straight to the page where the [from, to] window begins instead of
-        paging through everything newer than 'to'."""
+        """Load the first page of a profile. With an upper bound the API can't
+        express, jump straight to the page where the [from, to] window begins
+        instead of paging through everything newer than 'to'."""
         try:
             start_page = 1
             if self._pg_until:
@@ -1887,24 +2055,56 @@ class Panel(ctk.CTk):
             msg = self._api_error_text(exc)
             self.after(0, lambda: self._profile_failed(msg))
             return
-        self._profile_worker(pid, start_page, append=False)
+        self._pg_start_page = start_page
+        self._pg_page_cache = {}
+        self._profile_worker(pid, start_page)
 
-    def on_load_more(self) -> None:
+    def on_prev_page(self) -> None:
+        if self._pg_searching or self._pg_profile is None or self._pg_page <= self._pg_start_page:
+            return
+        self._lock_profile_pager()  # lock now, before any await -> no rapid double-fire
+        self._go_to_page(self._pg_page - 1)
+
+    def on_next_page(self) -> None:
         if self._pg_searching or self._pg_profile is None:
             return
-        self._fetch_profile_page(append=True)
+        _, raw_count = self._pg_page_cache.get(self._pg_page, ([], 0))
+        if raw_count < 50:  # last page -> nothing more to load
+            return
+        self._lock_profile_pager()
+        self._go_to_page(self._pg_page + 1)
 
-    def _fetch_profile_page(self, append: bool) -> None:
+    def _lock_profile_pager(self) -> None:
+        """Immediately mark busy and disable the pager, so a rapidly repeated click
+        can't queue a second fetch before the first even starts. _render_page
+        (via _update_pager) unlocks once the page is shown."""
         self._pg_searching = True
+        self.pager_prev.configure(state="disabled")
+        self.pager_next.configure(state="disabled")
+
+    def _refresh_profile(self) -> None:
+        """↻ Reload the current profile from its first page with a fresh API call —
+        e.g. to pull in a match that just finished, whose replay may still be
+        arriving. Keeps the active date/mode filters; drops the page cache."""
+        if self._pg_searching or self._pg_profile is None:
+            return
+        self._start_profile(self._pg_profile)
+
+    def _go_to_page(self, page: int) -> None:
+        """Show ``page``: instantly from the RAM cache when already fetched, else
+        fetch it. Only the current page's cards are ever built, so the widget/handle
+        count stays bounded however far you page. (The caller has already locked
+        the pager.)"""
+        if page in self._pg_page_cache:
+            self._render_page(page)
+            return
         self.p_search_btn.configure(state="disabled")
-        self.load_more_btn.configure(state="disabled")
         self.p_status.configure(text="Loading…")
-        pid, page = self._pg_profile, self._pg_page + 1
         threading.Thread(
-            target=self._profile_worker, args=(pid, page, append), daemon=True
+            target=self._profile_worker, args=(self._pg_profile, page), daemon=True
         ).start()
 
-    def _profile_worker(self, pid: int, page: int, append: bool) -> None:
+    def _profile_worker(self, pid: int, page: int) -> None:
         try:
             games, total = aoe4world.player_games(
                 pid, page, since=self._pg_since, leaderboard=self._pg_mode
@@ -1930,37 +2130,42 @@ class Panel(ctk.CTk):
                 p for p in aoe4world._player_ids(game) if p not in (pid, opponent)
             ]
             summaries.append(s)
-        raw_count = len(games)
-        self.after(0, lambda: self._show_games(summaries, total, raw_count, page, append))
+        self._pg_page_cache[page] = (summaries, len(games))
+        self._pg_total = total
+        self.after(0, lambda: self._render_page(page))
 
-    def _show_games(
-        self, summaries: list[dict], total: int | None, raw_count: int, page: int, append: bool
-    ) -> None:
+    def _render_page(self, page: int) -> None:
+        """Replace the on-screen cards with this page's, destroying the previous
+        page's widgets so only one page's worth ever exist at once."""
         self._pg_searching = False
         self._pg_page = page
-        self._pg_total = total
         self.p_search_btn.configure(state="normal")
-        if not append:
-            for child in self.games.winfo_children():
-                child.destroy()
-            self._pg_loaded = 0
+        summaries, raw_count = self._pg_page_cache.get(page, ([], 0))
+        self._hide_roster_tip()  # a page swap destroys the cards; drop any open hover first
+        for child in self.games.winfo_children():
+            child.destroy()
         for summary in summaries:
             self._game_card(self.games, summary)
-        self._pg_loaded += len(summaries)
-        if not append:  # a fresh search -> show it from the top, not where load-more left off
-            self.after(0, lambda: self._scroll_to_top(self.games))
+        self.after(0, lambda: self._scroll_to_top(self.games))
+        count = len(summaries)
         if self._pg_until:  # date-range filter active
-            text = f"{self._pg_loaded} in range" if self._pg_loaded else "No games in range."
+            text = f"{count} in range" if count else "No games on this page."
         else:
-            total_txt = f" / {total} total" if total else ""
-            text = f"{self._pg_loaded} shown{total_txt}" if self._pg_loaded else "No games."
+            total_txt = f" / {self._pg_total} total" if self._pg_total else ""
+            text = f"{count} shown{total_txt}" if count else "No games."
         self.p_status.configure(text=text)
-        # a full page (50) means more pages remain
-        if raw_count >= 50:
-            self.load_more_btn.configure(state="normal")
-            self.load_more_btn.pack(padx=12, pady=(0, 8))
+        self._update_pager(page, raw_count)
+
+    def _update_pager(self, page: int, raw_count: int) -> None:
+        has_prev = page > self._pg_start_page
+        has_next = raw_count >= 50  # a full page means more remain
+        self.pager_label.configure(text=f"Page {page - self._pg_start_page + 1}")
+        self.pager_prev.configure(state="normal" if has_prev else "disabled")
+        self.pager_next.configure(state="normal" if has_next else "disabled")
+        if has_prev or has_next:  # only show the bar when there's somewhere to go
+            self.pager.pack(pady=(0, 6))
         else:
-            self.load_more_btn.pack_forget()
+            self.pager.pack_forget()
 
     # ---- download ---------------------------------------------------------
 
@@ -2113,17 +2318,50 @@ class Panel(ctk.CTk):
         return value
 
     def refresh_downloads(self) -> None:
-        for child in self.downloads.winfo_children():
-            child.destroy()
-        self._play_buttons.clear()
         folder = self.cfg.downloads_dir
-        files = (
+        self._dl_files = (
             sorted(folder.glob("*.rec"), key=self._replay_order_key, reverse=True)
             if folder.exists() else []
         )
-        self._prune_match_info(files)  # forget replays deleted in-app or manually
-        context = self._load_search_context()  # game_id -> [searched_id, opponent_id]
-        if not files:
+        self._prune_match_info(self._dl_files)  # forget replays deleted in-app or manually
+        self._dl_page = min(max(1, self._dl_page), self._dl_total_pages())  # clamp after delete
+        self._render_downloads_page()
+
+    def _dl_total_pages(self) -> int:
+        return max(1, (len(self._dl_files) + 49) // 50)
+
+    def on_dl_prev_page(self) -> None:
+        if self._dl_page > 1:
+            self._dl_page -= 1
+            self._render_downloads_page()
+            self.after(0, lambda: self._scroll_to_top(self.downloads))
+
+    def on_dl_next_page(self) -> None:
+        if self._dl_page < self._dl_total_pages():
+            self._dl_page += 1
+            self._render_downloads_page()
+            self.after(0, lambda: self._scroll_to_top(self.downloads))
+
+    def _update_dl_pager(self) -> None:
+        total_pages = self._dl_total_pages()
+        if total_pages <= 1:  # 50 or fewer -> no navigation needed
+            self.dl_pager.pack_forget()
+            return
+        self.dl_pager_label.configure(text=f"Page {self._dl_page}")  # same look as the search tabs
+        self.dl_pager_prev.configure(state="normal" if self._dl_page > 1 else "disabled")
+        self.dl_pager_next.configure(
+            state="normal" if self._dl_page < total_pages else "disabled"
+        )
+        self.dl_pager.pack(side="bottom", pady=(0, 6))  # centered, matching the top pagers
+
+    def _render_downloads_page(self) -> None:
+        self._hide_roster_tip()  # a page swap destroys the rows; drop any open hover first
+        for child in self.downloads.winfo_children():
+            child.destroy()
+        self._play_buttons.clear()
+        if not self._dl_files:
+            self.dl_pager.pack_forget()
+            self.dl_count_label.configure(text="0 replays")
             ctk.CTkLabel(
                 self.downloads,
                 text="No downloaded replays yet.",
@@ -2131,7 +2369,9 @@ class Panel(ctk.CTk):
                 font=self.font_normal,
             ).pack(anchor="w", padx=10, pady=8)
             return
-        for path in files:
+        context = self._load_search_context()  # game_id -> [searched_id, opponent_id]
+        start = (self._dl_page - 1) * 50
+        for path in self._dl_files[start : start + 50]:
             row = ctk.CTkFrame(self.downloads, fg_color=CARD, corner_radius=10)
             row.pack(fill="x", padx=6, pady=4)
             game_id = aoe4world.game_id_from_name(path.name)
@@ -2187,15 +2427,15 @@ class Panel(ctk.CTk):
                 ids = (int(ctx[0]), int(ctx[1])) if ctx and len(ctx) >= 2 else None
                 args = (game_id, meta, ids)
                 threading.Thread(target=self._fetch_info, args=args, daemon=True).start()
-        count = len(files)
-        ctk.CTkLabel(
-            self.downloads,
-            text=f"{count} replay{'s' if count != 1 else ''}",
-            text_color=MUTED,
-            font=self.font_meta,
-        ).pack(pady=(8, 4))
+        count = len(self._dl_files)
+        self.dl_count_label.configure(text=f"{count} replay{'s' if count != 1 else ''}")
+        self._update_dl_pager()
 
     def _render_download_summary(self, parent: ctk.CTkFrame, summary: dict) -> None:
+        # Download rows are (re)built here — including asynchronously by _fetch_info
+        # once a match's details arrive — so drop any open hover first; otherwise a
+        # tooltip whose source label is about to be destroyed could be stranded.
+        self._hide_roster_tip()
         for child in parent.winfo_children():
             child.destroy()
         when = (
