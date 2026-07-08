@@ -106,6 +106,54 @@ def clean_workspace(cfg: Config) -> None:
     _clean_stale_workdirs(cfg)
 
 
+def delete_all_replays(cfg: Config) -> int:
+    """Delete every downloaded replay (.rec) and its cached match metadata.
+
+    Returns the number of replay files removed. The downloads directory itself is
+    kept so the panel can keep using it.
+    """
+    folder = cfg.downloads_dir
+    removed = 0
+    if folder.is_dir():
+        for rec in folder.glob("*.rec"):
+            with contextlib.suppress(OSError):
+                rec.unlink()
+                removed += 1
+        for cache in (".match-info.json", ".search-context.json"):
+            with contextlib.suppress(OSError):
+                (folder / cache).unlink(missing_ok=True)
+    return removed
+
+
+def factory_reset(cfg: Config) -> None:
+    """Erase all app data so the next run starts from a clean first-day state.
+
+    Removes the build store, every downloaded replay, the Steam session/login,
+    all work + cache directories and the downloaded tool binaries — nothing that
+    needs the network or a Steam sign-in survives. The application executable and
+    the shipped config template are left intact (config.local.toml is re-seeded /
+    falls back to defaults on the next launch, so Steam starts signed-out).
+    """
+    root = cfg.project_root
+    for directory in (
+        cfg.repo,                # restic build store (the bulk of the space)
+        cfg.downloads_dir,       # downloaded replays + their caches
+        root / "steam_session",  # DepotDownloader remembered login
+        _launch_work(cfg),       # composed builds + saved_builds.json
+        _work_dir(cfg),          # content index + scratch (.aoe4-work)
+        root / ".aoe4-restore",  # restore scratch
+        root / ".exever",        # exe-version harvest cache
+        root / "tools",          # DepotDownloader / restic binaries (re-downloaded)
+    ):
+        _force_rmtree(directory)
+    for file in (
+        root / ".restic-password",   # regenerated for the fresh store
+        root / "config.local.toml",  # drops the cached Steam username -> signed out
+    ):
+        with contextlib.suppress(OSError):
+            file.unlink(missing_ok=True)
+
+
 def _work_dir(cfg: Config) -> Path:
     return cfg.project_root / ".aoe4-work"
 
@@ -178,6 +226,7 @@ def sync_build_map(cfg: Config, url: str = BUILD_MAP_URL, timeout: int = 5) -> b
         if json.dumps(merged, sort_keys=True) == json.dumps(local, sort_keys=True):
             return False  # nothing new
         # Atomic write: a concurrent playback worker must never read a half-written map.
+        path.parent.mkdir(parents=True, exist_ok=True)  # a fresh / just-reset root has no data/
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(merged, indent=4), encoding="utf-8")
         os.replace(tmp, path)

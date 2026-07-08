@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -821,6 +822,14 @@ class Panel(ctk.CTk):
             dl_header, text="", text_color=MUTED, font=self.font_bold
         )
         self.dl_count_label.pack(side="left", padx=(12, 0))
+        # shown only when there's more than one replay (see _render_downloads_page) —
+        # a download-watch-delete-one-at-a-time user never needs a "delete all".
+        self.dl_delete_all_btn = ctk.CTkButton(
+            dl_header, text=f"{ICON_TRASH}  Delete all replays",
+            width=180, height=34, corner_radius=8,
+            fg_color=DANGER, hover_color=DANGER_HOVER, font=self.font_bold,
+            command=self._delete_all_replays,
+        )
 
         self.downloads = ctk.CTkScrollableFrame(
             self.download_pane,
@@ -1214,13 +1223,13 @@ class Panel(ctk.CTk):
         self.p_search_btn.pack(side="left", padx=(0, 8), pady=4)
         # far-right refresh: reload the current profile from page 1 with a fresh API
         # call (e.g. a just-finished match whose replay is still on its way in).
+        # Packed only once games are actually listed (see _render_page).
         self.p_refresh_btn = ctk.CTkButton(
             top, text=ICON_RELOAD, width=44, height=38, corner_radius=8,
             fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
             font=ctk.CTkFont(size=26, weight="bold"),  # 2x icon, button size unchanged
             command=self._refresh_profile,
         )
-        self.p_refresh_btn.pack(side="right", padx=(0, 6), pady=4)
         self.p_filter_box, self.p_filter_btn, self.p_filter_clear, self.p_filter_mode = (
             self._make_filter_box(
                 top, self._open_profile_filter, self._reset_profile, self._apply_profile_mode
@@ -1273,6 +1282,14 @@ class Panel(ctk.CTk):
             self._make_filter_box(
                 top, self._open_h2h_filter, self._reset_h2h, self._apply_h2h_mode
             )
+        )
+        # far-right refresh: reload this head-to-head from page 1 with a fresh API
+        # call. Packed only once matches are actually listed (see _h2h_render_page).
+        self.h_refresh_btn = ctk.CTkButton(
+            top, text=ICON_RELOAD, width=44, height=38, corner_radius=8,
+            fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
+            font=ctk.CTkFont(size=26, weight="bold"),  # 2x icon, button size unchanged
+            command=self._refresh_h2h,
         )
 
         self.matches = ctk.CTkScrollableFrame(
@@ -1799,6 +1816,14 @@ class Panel(ctk.CTk):
         self.h_pager_prev.configure(state="disabled")
         self.h_pager_next.configure(state="disabled")
 
+    def _refresh_h2h(self) -> None:
+        """↻ Reload this head-to-head from its first page with a fresh API call —
+        e.g. to pull in a match that just finished. Keeps the active date/mode
+        filters; drops the page cache."""
+        if self._searching or self._h2h_ids is None:
+            return
+        self._start_h2h(*self._h2h_ids)
+
     def _h2h_go_to_page(self, page: int) -> None:
         if page in self._h2h_page_cache:
             self._h2h_render_page(page)
@@ -1838,6 +1863,7 @@ class Panel(ctk.CTk):
     def _h2h_render_page(self, page: int) -> None:
         self._set_h2h_busy(False)
         self._h2h_page = page
+        self.h_refresh_btn.pack(side="right", padx=(0, 6), pady=4)  # show once matches listed
         summaries, raw_count = self._h2h_page_cache.get(page, ([], 0))
         self._hide_roster_tip()  # a page swap destroys the cards; drop any open hover first
         for child in self.matches.winfo_children():
@@ -1931,6 +1957,7 @@ class Panel(ctk.CTk):
         self.p_filter_clear.pack_forget()
         self.p_filter_box.pack_forget()
         self.pager.pack_forget()
+        self.p_refresh_btn.pack_forget()
         for child in self.games.winfo_children():
             child.destroy()
         self.p_status.configure(text="")
@@ -1971,6 +1998,7 @@ class Panel(ctk.CTk):
         self.h_filter_clear.pack_forget()
         self.h_filter_box.pack_forget()
         self.h_pager.pack_forget()
+        self.h_refresh_btn.pack_forget()
         for child in self.matches.winfo_children():
             child.destroy()
         self.status.configure(text="")
@@ -2140,6 +2168,7 @@ class Panel(ctk.CTk):
         self._pg_searching = False
         self._pg_page = page
         self.p_search_btn.configure(state="normal")
+        self.p_refresh_btn.pack(side="right", padx=(0, 6), pady=4)  # show once games are listed
         summaries, raw_count = self._pg_page_cache.get(page, ([], 0))
         self._hide_roster_tip()  # a page swap destroys the cards; drop any open hover first
         for child in self.games.winfo_children():
@@ -2361,6 +2390,7 @@ class Panel(ctk.CTk):
         self._play_buttons.clear()
         if not self._dl_files:
             self.dl_pager.pack_forget()
+            self.dl_delete_all_btn.pack_forget()
             self.dl_count_label.configure(text="0 replays")
             ctk.CTkLabel(
                 self.downloads,
@@ -2429,6 +2459,10 @@ class Panel(ctk.CTk):
                 threading.Thread(target=self._fetch_info, args=args, daemon=True).start()
         count = len(self._dl_files)
         self.dl_count_label.configure(text=f"{count} replay{'s' if count != 1 else ''}")
+        if count > 1:  # a one-in-one-out user never sees a pointless "delete all"
+            self.dl_delete_all_btn.pack(side="right")
+        else:
+            self.dl_delete_all_btn.pack_forget()
         self._update_dl_pager()
 
     def _render_download_summary(self, parent: ctk.CTkFrame, summary: dict) -> None:
@@ -2796,6 +2830,19 @@ class Panel(ctk.CTk):
         container.pack(fill="both", expand=True, padx=18, pady=14)
         self.saved_total = ctk.CTkLabel(container, text="", text_color=MUTED, font=self.font_meta)
         self.saved_total.pack(anchor="w", pady=(0, 8))
+        # Danger zone (packed first at the bottom so the list fills the space above it):
+        # bulk deletes for reclaiming disk once old replays are gone from the server.
+        danger = ctk.CTkFrame(container, fg_color="transparent")
+        danger.pack(side="bottom", fill="x", pady=(14, 0))
+        ctk.CTkLabel(
+            danger, text="Danger zone", text_color=MUTED, font=self.font_bold
+        ).pack(anchor="w", pady=(0, 6))
+        self._reset_btn = ctk.CTkButton(
+            danger, text="⚠  Factory reset", height=36, corner_radius=8,
+            fg_color=DANGER, hover_color=DANGER_HOVER, font=self.font_bold,
+            command=self._factory_reset,
+        )
+        self._reset_btn.pack(anchor="w")
         self.saved_list = ctk.CTkScrollableFrame(container, fg_color="transparent")
         self.saved_list.pack(fill="both", expand=True)
 
@@ -2883,6 +2930,86 @@ class Panel(ctk.CTk):
         with contextlib.suppress(Exception):
             buildcache.delete_build(self.cfg, build_id)
         self._refresh_saved_builds()
+
+    def _delete_all_replays(self) -> None:
+        if self._downloading or self._playing:
+            self._info("Busy", "Finish the current download or replay first.")
+            return
+        folder = self.cfg.downloads_dir
+        recs = list(folder.glob("*.rec")) if folder.is_dir() else []
+        if not recs:
+            self._info("No replays", "There are no downloaded replays to delete.")
+            return
+        n = len(recs)
+        if not self._confirm(
+            "Delete all replays?",
+            f"Permanently delete all {n} downloaded replay{'s' if n != 1 else ''}?\n\n"
+            "This can't be undone. Builds and your Steam sign-in are kept — only the "
+            "replay files are removed.",
+            ok="Delete all", danger=True,
+        ):
+            return
+        with contextlib.suppress(Exception):
+            service.delete_all_replays(self.cfg)
+        self.refresh_downloads()
+
+    def _factory_reset(self) -> None:
+        if self._downloading or self._playing or self._searching or self._pg_searching:
+            self._info(
+                "Busy", "Finish the current download, search or replay before resetting."
+            )
+            return
+        if not self._confirm(
+            "Factory reset",
+            "This permanently erases EVERYTHING and returns the app to its first-run "
+            "state:\n\n"
+            "•  All saved & cached builds (the entire build store)\n"
+            "•  All downloaded replays\n"
+            "•  Your Steam sign-in\n"
+            "•  All downloaded tool files\n\n"
+            "This cannot be undone — every build must be re-downloaded and you'll need "
+            "to sign in to Steam again.",
+            ok="Reset everything", danger=True,
+        ):
+            return
+        # Deleting the store can take a while (tens of GB) -> off the UI thread.
+        self._reset_btn.configure(state="disabled", text="Resetting…")
+        threading.Thread(target=self._factory_reset_worker, daemon=True).start()
+
+    def _factory_reset_worker(self) -> None:
+        error = None
+        try:
+            service.factory_reset(self.cfg)
+        except Exception as exc:  # noqa: BLE001 - report instead of crashing the UI
+            error = str(exc)
+        self.after(0, lambda: self._factory_reset_done(error))
+
+    def _factory_reset_done(self, error: str | None) -> None:
+        if error:
+            with contextlib.suppress(Exception):
+                self._reset_btn.configure(state="normal", text="⚠  Factory reset")
+            self._info_cache.clear()  # its replays are gone; don't rewrite stale entries
+            with contextlib.suppress(Exception):
+                self.refresh_downloads()
+                self._refresh_saved_builds()
+            self._info("Factory reset", f"Some files could not be removed:\n{error}")
+            return
+        # Success -> relaunch so the app comes back up in a clean first-run state
+        # (Steam sign-in prompt, empty lists) instead of asking the user to restart.
+        with contextlib.suppress(Exception):
+            self._reset_btn.configure(text="Restarting…")
+        self.after(400, self._restart_app)
+
+    def _restart_app(self) -> None:
+        """Launch a fresh instance with the exact original command (dev ``-m`` run or
+        the packaged exe), inheriting the current environment (e.g. AOE4REPLAY_ROOT),
+        then close this window so only the clean instance remains."""
+        args = list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv])
+        _release_single_instance()  # drop the mutex first so the new instance isn't blocked
+        with contextlib.suppress(Exception):
+            subprocess.Popen(args)
+        with contextlib.suppress(Exception):
+            self.destroy()
 
     def _on_close(self) -> None:
         # Cancel an in-flight download so DepotDownloader is killed rather than
@@ -3044,6 +3171,20 @@ def _acquire_single_instance(name: str = "AoE4ReplayLauncher_SingleInstance") ->
         return False
     _single_instance_handle = handle  # hold it open so the lock stays for our lifetime
     return True
+
+
+def _release_single_instance() -> None:
+    """Close our named-mutex handle so a relaunch (after a factory reset) can take the
+    lock immediately instead of racing our still-exiting process and being told the
+    app is 'already running'."""
+    global _single_instance_handle
+    if _single_instance_handle is None:
+        return
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(_single_instance_handle)
+    _single_instance_handle = None
 
 
 def run(cfg: Config) -> None:
