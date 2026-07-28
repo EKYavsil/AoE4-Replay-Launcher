@@ -1032,6 +1032,8 @@ class Panel(ctk.CTk):
 
         self._searching = False
         self._playing = False
+        self._game_running = False  # AoE4 open per the Steam registry -> lock actions
+        self._game_watcher = None  # event-driven watcher of the Steam "running" value
         self._downloading = False  # a replay download is running -> block a second
         self._cancel_event: threading.Event | None = None  # set while a download runs
         self._play_buttons: list[ctk.CTkButton] = []
@@ -1155,6 +1157,7 @@ class Panel(ctk.CTk):
         ).start()
         # check for a newer app release in the background (Velopack auto-update)
         threading.Thread(target=self._check_for_updates, daemon=True).start()
+        self._start_game_watch()  # lock Play/Delete while AoE4 is open (registry watch)
 
     # ---- Steam sign-in ----------------------------------------------------
 
@@ -5721,7 +5724,7 @@ class Panel(ctk.CTk):
         delete_key = ("delete", str(path))
         play_path = "theme/button-play-face.png"
         delete_path = "theme/button-delete-face.png"
-        actions_disabled = self._playing
+        actions_disabled = self._replay_actions_locked()
         if actions_disabled:
             play_face = self._canvas_disabled_photo(play_path, (144, 42))
             delete_face = self._canvas_disabled_photo(delete_path, (144, 42))
@@ -7261,12 +7264,14 @@ class Panel(ctk.CTk):
 
         self.after(0, update)
 
-    def _set_playing(self, playing: bool) -> None:
-        """Keep replay action hitboxes and their visual state in sync."""
+    def _replay_actions_locked(self) -> bool:
+        """Play/Delete are blocked while we're mid-playback (worker busy) or while
+        AoE4 is actually running (from the event-driven Steam-registry watch)."""
+        return self._playing or self._game_running
 
-        changed = self._playing != playing
-        self._playing = playing
-        if not changed or not hasattr(self, "downloads"):
+    def _apply_action_lock(self) -> None:
+        """Repaint the Play/Delete controls to match the current lock state."""
+        if not hasattr(self, "downloads"):
             return
         with contextlib.suppress(tk.TclError):
             self.downloads._clear_hover()
@@ -7274,11 +7279,39 @@ class Panel(ctk.CTk):
             self.downloads.refresh(immediate=True)
         if hasattr(self, "dl_delete_all_btn"):
             self.dl_delete_all_btn.configure(
-                state="disabled" if playing else "normal"
+                state="disabled" if self._replay_actions_locked() else "normal"
             )
 
+    def _set_playing(self, playing: bool) -> None:
+        """Keep replay action hitboxes and their visual state in sync."""
+        if self._playing == playing:
+            return
+        self._playing = playing
+        self._apply_action_lock()
+
+    def _start_game_watch(self) -> None:
+        """Reflect AoE4's open/closed state (launched by us or externally) on the
+        Play/Delete controls, via an event-driven registry watch — no polling: the
+        watcher thread sleeps until Steam flips the value, then calls back here."""
+        self._game_running = launch.steam_app_running(self.cfg.app_id)  # initial state
+        self._apply_action_lock()
+
+        def on_change(running: bool) -> None:
+            # Called from the watcher thread; hop to the UI thread to repaint.
+            self.after(0, lambda r=running: self._on_game_state_change(r))
+
+        with contextlib.suppress(Exception):
+            self._game_watcher = launch.SteamRunWatcher(self.cfg.app_id, on_change)
+            self._game_watcher.start()
+
+    def _on_game_state_change(self, running: bool) -> None:
+        if running == self._game_running:
+            return
+        self._game_running = running
+        self._apply_action_lock()
+
     def _delete(self, path: Path) -> None:
-        if self._playing:
+        if self._replay_actions_locked():
             return
         if not self._confirm(
             "Delete replay", f"Delete {path.name}?", ok="Delete", danger=True
@@ -7294,7 +7327,7 @@ class Panel(ctk.CTk):
     def _play(self, path: Path) -> None:
         if self._playing:
             return
-        if launch.is_game_running():
+        if self._game_running or launch.is_game_running():
             self._info(
                 "Game running", "Age of Empires IV is already running. Close it first."
             )
@@ -7821,6 +7854,9 @@ class Panel(ctk.CTk):
 
     def _on_close(self) -> None:
         self._cancel_window_resize()
+        if self._game_watcher is not None:  # wake the registry-watch thread so it exits
+            with contextlib.suppress(Exception):
+                self._game_watcher.stop()
         # Cancel an in-flight download so DepotDownloader is killed rather than
         # orphaned (it would otherwise keep running after the window closes).
         # Give the watchdog a moment to act before we exit.

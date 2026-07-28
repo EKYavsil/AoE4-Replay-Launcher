@@ -16,8 +16,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,12 +32,10 @@ from .config import Config
 _EXE_CANDIDATES = ("RelicCardinal.exe", "AoE4.exe")
 _GAME_IMAGE = "RelicCardinal.exe"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console pop-ups under pythonw
-# Steam clears its "in-game" state a few seconds after the process exits (measured
-# ~10s for a Steam launch). We wait this long before re-enabling Play so a new
-# launch never collides with Steam's stale state. A fixed wait — deliberately not
-# the Steam registry keys — keeps the binary off antivirus heuristics that flag a
-# downloader-style exe for polling HKCU\Software\Valve\Steam right after spawning a child.
-_STEAM_SETTLE_SECONDS = 15
+# How long to wait for the game to appear (Steam's registry Running flag going 1)
+# after we ask Steam to launch it, before giving up. The subsequent wait for it to
+# exit is unbounded — a replay can run a long time.
+_GAME_APPEAR_TIMEOUT = 180
 # Steam writes localconfig.vdf as it shuts down; on some machines the process leaves
 # the task list a moment before that flush lands on disk. Wait this long after Steam
 # is gone before writing our LaunchOptions, so Steam's trailing flush can't overwrite
@@ -116,6 +116,189 @@ def _process_running(image: str) -> bool:
 def is_game_running() -> bool:
     """True if the AoE4 executable is currently running."""
     return _process_running(_GAME_IMAGE)
+
+
+def steam_app_running(app_id: str) -> bool:
+    """True if Steam marks the given app as in-game, read from its registry value
+    ``HKCU\\Software\\Valve\\Steam\\Apps\\<app_id>\\Running`` (DWORD 1 while running).
+
+    A plain :mod:`winreg` read — the same mechanism already used to locate the Steam
+    install and the active user."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, rf"Software\Valve\Steam\Apps\{app_id}"
+        ) as key:
+            running, _ = winreg.QueryValueEx(key, "Running")
+        return int(running) != 0
+    except (OSError, ValueError):
+        return False
+
+
+class SteamRunWatcher:
+    """Event-driven watch of the Steam "app running" registry value.
+
+    Instead of polling, a daemon thread blocks in ``RegNotifyChangeKeyValue`` — it
+    consumes no CPU while idle and wakes the instant Steam flips the value — then
+    calls ``on_change(running: bool)`` from that thread. The caller marshals the
+    result onto its UI thread. ``stop()`` signals a private event so the blocked
+    thread returns and exits cleanly at shutdown.
+    """
+
+    _REG_NOTIFY_CHANGE_LAST_SET = 0x0000_0004
+    _INFINITE = 0xFFFF_FFFF
+    _WAIT_OBJECT_0 = 0
+
+    def __init__(self, app_id: str, on_change) -> None:
+        self._app_id = str(app_id)
+        self._on_change = on_change
+        self._thread: threading.Thread | None = None
+        self._stop_event = None  # win32 auto/manual-reset event handle
+
+    def start(self) -> None:
+        if self._thread is not None or os.name != "nt":
+            return
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.CreateEventW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR
+        ]
+        self._stop_event = kernel32.CreateEventW(None, True, False, None)  # manual-reset
+        if not self._stop_event:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop_event:
+            with contextlib.suppress(Exception):
+                ctypes.windll.kernel32.SetEvent(wintypes.HANDLE(self._stop_event))
+
+    def _run(self) -> None:
+        import winreg
+
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        advapi32.RegNotifyChangeKeyValue.restype = wintypes.LONG
+        advapi32.RegNotifyChangeKeyValue.argtypes = [
+            wintypes.HANDLE, wintypes.BOOL, wintypes.DWORD, wintypes.HANDLE, wintypes.BOOL
+        ]
+        kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
+        kernel32.WaitForMultipleObjects.argtypes = [
+            wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD
+        ]
+        change_event = kernel32.CreateEventW(None, False, False, None)  # auto-reset
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                rf"Software\Valve\Steam\Apps\{self._app_id}",
+                0,
+                winreg.KEY_READ | winreg.KEY_NOTIFY,
+            )
+        except OSError:
+            with contextlib.suppress(Exception):
+                kernel32.CloseHandle(wintypes.HANDLE(change_event))
+            return
+        try:
+            hkey = wintypes.HANDLE(int(key))
+            waits = (wintypes.HANDLE * 2)(change_event, self._stop_event)
+            while True:
+                rc = advapi32.RegNotifyChangeKeyValue(
+                    hkey, False, self._REG_NOTIFY_CHANGE_LAST_SET,
+                    wintypes.HANDLE(change_event), True,
+                )
+                if rc != 0:  # couldn't arm the notification -> stop watching
+                    break
+                result = kernel32.WaitForMultipleObjects(2, waits, False, self._INFINITE)
+                if result != self._WAIT_OBJECT_0:
+                    break  # stop event signalled (or an error) -> exit the thread
+                with contextlib.suppress(Exception):
+                    self._on_change(steam_app_running(self._app_id))
+        finally:
+            with contextlib.suppress(Exception):
+                key.Close()
+            with contextlib.suppress(Exception):
+                kernel32.CloseHandle(wintypes.HANDLE(change_event))
+
+
+_WAIT_INFINITE = 0xFFFF_FFFF
+
+
+def _wait_for_steam_running_state(
+    app_id: str, target: bool, timeout: float | None
+) -> bool:
+    """Block until the app's registry ``Running`` flag equals ``target``, event-driven
+    via ``RegNotifyChangeKeyValue`` — the thread sleeps until Steam changes the value,
+    so there is no busy polling and no fixed delay. ``timeout`` is seconds, or None to
+    wait indefinitely (used while a replay plays). Returns True if the target state was
+    reached, False on timeout."""
+    if os.name != "nt":
+        return False
+    if steam_app_running(app_id) == target:
+        return True
+    import winreg
+
+    kernel32 = ctypes.windll.kernel32
+    advapi32 = ctypes.windll.advapi32
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.argtypes = [
+        wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR
+    ]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    advapi32.RegNotifyChangeKeyValue.restype = wintypes.LONG
+    advapi32.RegNotifyChangeKeyValue.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, wintypes.DWORD, wintypes.HANDLE, wintypes.BOOL
+    ]
+    event = kernel32.CreateEventW(None, False, False, None)  # auto-reset
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            rf"Software\Valve\Steam\Apps\{app_id}",
+            0,
+            winreg.KEY_READ | winreg.KEY_NOTIFY,
+        )
+    except OSError:
+        with contextlib.suppress(Exception):
+            kernel32.CloseHandle(wintypes.HANDLE(event))
+        return steam_app_running(app_id) == target
+    try:
+        hkey = wintypes.HANDLE(int(key))
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while steam_app_running(app_id) != target:
+            if deadline is None:
+                wait_ms = _WAIT_INFINITE
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait_ms = int(remaining * 1000)
+            rc = advapi32.RegNotifyChangeKeyValue(
+                hkey, False, SteamRunWatcher._REG_NOTIFY_CHANGE_LAST_SET,
+                wintypes.HANDLE(event), True,
+            )
+            if rc != 0:
+                break
+            kernel32.WaitForSingleObject(wintypes.HANDLE(event), wait_ms)
+    finally:
+        with contextlib.suppress(Exception):
+            key.Close()
+        with contextlib.suppress(Exception):
+            kernel32.CloseHandle(wintypes.HANDLE(event))
+    return steam_app_running(app_id) == target
+
+
+def _wait_for_steam_game_session(cfg: Config, appear_timeout: int = _GAME_APPEAR_TIMEOUT) -> None:
+    """Wait for AoE4 to start and then fully stop, entirely from Steam's registry
+    ``Running`` flag — event-driven, so no ``tasklist`` polling and no fixed settle.
+    The exit wait is unbounded (a replay can run a long time); Steam clears the flag
+    a moment after the game closes, which is exactly when a new launch is safe."""
+    if not _wait_for_steam_running_state(cfg.app_id, True, appear_timeout):
+        print("AoE4 was not observed starting; not waiting.")
+        return
+    print("AOE4 is running. Waiting for it to exit...")
+    _wait_for_steam_running_state(cfg.app_id, False, None)
 
 
 def _steam_logged_in() -> bool:
@@ -819,33 +1002,6 @@ def restore_user_mods(state: ModsState | None) -> None:
     print("AOE4 user mods restored.")
 
 
-def _wait_for_game_exit(image: str, appear_timeout: int = 180) -> None:
-    appeared = False
-    for _ in range(appear_timeout):
-        if _process_running(image):
-            appeared = True
-            break
-        time.sleep(1)
-    if not appeared:
-        print(f"{image} was not observed starting; not waiting.")
-        return
-    print("AOE4 is running. Waiting for it to exit...")
-    while _process_running(image):
-        time.sleep(2)
-
-
-def _wait_for_steam_idle(cfg: Config) -> None:
-    """After the game exits, give Steam time to clear its "in-game" state.
-
-    Steam keeps reporting the app as running for several seconds after the process
-    is gone; launching a new replay into that gap collides with the stale state
-    (long hang, tiny window, etc.). We wait a fixed interval rather than reading
-    Steam's registry keys, so the panel re-enables Play only once Steam is free
-    without the binary doing registry recon that trips antivirus heuristics.
-    """
-    time.sleep(_STEAM_SETTLE_SECONDS)
-
-
 def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = False) -> None:
     """Launch a current-build replay *through Steam* (``steam -applaunch``).
 
@@ -867,10 +1023,9 @@ def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = Fal
         ]
         print(f"Launching AOE4 through Steam: {' '.join(args)}")
         subprocess.Popen(args)
-        # The game is a child of Steam, not us, so watch the image rather than wait()
-        # on our Popen (which is just the steam.exe forwarder and exits immediately).
-        _wait_for_game_exit(_GAME_IMAGE)
-        _wait_for_steam_idle(cfg)
+        # The game runs as a child of Steam, so track Steam's own app "running"
+        # flag (event-driven) rather than waiting on our forwarder Popen.
+        _wait_for_steam_game_session(cfg)
     finally:
         restore_user_mods(mods_state)
 
@@ -928,8 +1083,7 @@ def launch_replay(
         args = [str(cfg.steam_exe), "-applaunch", cfg.app_id]
         print(f"Launching reconstructed AOE4 build through Steam: {' '.join(args)}")
         subprocess.Popen(args, creationflags=_NO_WINDOW)
-        _wait_for_game_exit(exe.name)
-        _wait_for_steam_idle(cfg)
+        _wait_for_steam_game_session(cfg)
     finally:
         try:
             _clear_active_replay_request(cfg)
