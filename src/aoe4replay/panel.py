@@ -20,7 +20,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -97,6 +96,7 @@ from . import (  # noqa: E402
     buildcache,
     config,
     launch,
+    nethttp,
     replay,
     service,
     steamqr,
@@ -1055,6 +1055,7 @@ class Panel(ctk.CTk):
         self._country_sources: dict[str, Image.Image] = {}
         self._country_images: dict[str, ctk.CTkImage] = {}
         self._country_failures: set[str] = set()
+        self._suggest_token = 0  # bumped per name search; guards the async flag refresh
         self._info_window: ctk.CTkToplevel | None = None
         self._active_tab = "Profile games"
         # profile-games tab paging state
@@ -4509,27 +4510,35 @@ class Panel(ctk.CTk):
         self._country_images[code] = image
         return image
 
-    def _load_country_flags(self, players: list[dict]) -> None:
+    def _load_country_flags(self, players: list[dict]) -> bool:
+        """Fetch each result's country flag from flagcdn over Happy Eyeballs +
+        keep-alive: one pooled connection serves every flag, so a network with slow
+        or broken IPv6 no longer pays a fresh (and possibly stalled) connect per
+        flag — which was the real cost that made name searches feel slow. Returns
+        True if at least one new flag was loaded (so the caller can refresh)."""
         codes = {
             str(player.get("country") or "").strip().lower()
             for player in players
             if len(str(player.get("country") or "").strip()) == 2
         }
+        loaded = False
         for code in codes:
             if code in self._country_sources or code in self._country_failures:
                 continue
             try:
-                request = urllib.request.Request(
+                status, body = nethttp.get(
                     f"https://flagcdn.com/w40/{code}.png",
+                    timeout=5,
                     headers={"User-Agent": "aoe4-replay-launcher"},
                 )
-                with (
-                    urllib.request.urlopen(request, timeout=5) as response,  # noqa: S310
-                    Image.open(io.BytesIO(response.read())) as image,
-                ):
+                if status != 200:
+                    raise OSError(f"flag request failed (HTTP {status})")
+                with Image.open(io.BytesIO(body)) as image:
                     self._country_sources[code] = image.convert("RGBA").copy()
+                loaded = True
             except (OSError, ValueError):
                 self._country_failures.add(code)
+        return loaded
 
     def _entry(self, parent: ctk.CTkFrame, placeholder: str, width: int) -> IconEntry:
         return IconEntry(
@@ -5644,6 +5653,11 @@ class Panel(ctk.CTk):
         if state is None:
             state = "downloaded" if destination.is_file() else "normal"
             self._canvas_download_states[game_id] = state
+        # A server-deleted replay has no button: leave the action column empty for
+        # that match (the rest of the row still shows). This is the last thing drawn
+        # in the row, so returning early is safe.
+        if state == "deleted":
+            return
         face_name = {
             "normal": "button-download-face.png",
             "loading": "button-downloading-face.png",
@@ -6009,7 +6023,8 @@ class Panel(ctk.CTk):
             for child in frame.winfo_children():
                 child.destroy()
         status.configure(text=f"Searching '{query}'…")
-        args = (query, frame, status, target_entry, after_pick, on_ready)
+        self._suggest_token += 1  # newer search invalidates an older one's async refresh
+        args = (query, frame, status, target_entry, after_pick, on_ready, self._suggest_token)
         threading.Thread(target=self._suggest_worker, args=args, daemon=True).start()
 
     @staticmethod
@@ -6030,7 +6045,7 @@ class Panel(ctk.CTk):
         self.p_status.configure(text=message)
 
     def _suggest_worker(
-        self, query, frame, status, target_entry, after_pick, on_ready=None
+        self, query, frame, status, target_entry, after_pick, on_ready=None, token=None
     ) -> None:
         try:
             players = aoe4world.search_players(query)
@@ -6038,20 +6053,38 @@ class Panel(ctk.CTk):
             msg = self._api_error_text(exc)
 
             def fail() -> None:
+                if token is not None and token != self._suggest_token:
+                    return  # a newer search superseded this one
                 status.configure(text=msg)
                 if on_ready is not None:
                     on_ready()
 
             self.after(0, fail)
             return
-        self._load_country_flags(players)
 
+        # Show the list at once; flags are fetched afterwards so a slow flagcdn
+        # can never hold the results back (it used to block the whole render).
         def render() -> None:
+            if token is not None and token != self._suggest_token:
+                return  # superseded — the newer search owns the frame now
             self._render_suggestions(
                 players, query, frame, status, target_entry, after_pick, on_ready
             )
 
         self.after(0, render)
+
+        # Load flags over Happy Eyeballs + keep-alive, then refresh so they pop in,
+        # unless a newer search has taken over in the meantime.
+        if self._load_country_flags(players):
+
+            def refresh() -> None:
+                if token is not None and token != self._suggest_token:
+                    return
+                self._render_suggestions(
+                    players, query, frame, status, target_entry, after_pick, None
+                )
+
+            self.after(0, refresh)
 
     def _render_suggestions(
         self, players, query, frame, status, target_entry, after_pick, on_ready=None
@@ -6881,8 +6914,11 @@ class Panel(ctk.CTk):
             self._save_match_info()  # persist the summary (set by the worker) across runs
             self.refresh_downloads()
         else:
+            # The replay is gone from the server: remove its Download button for that
+            # match. On the virtual canvas that means marking it "deleted" so the row
+            # renderer draws no button (the old CTk path destroyed the widget outright).
             if isinstance(btn, CanvasButtonProxy):
-                self._set_download_button_face(btn, "normal")
+                self._set_download_button_face(btn, "deleted")
             else:
                 with contextlib.suppress(Exception):
                     btn.destroy()

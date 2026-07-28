@@ -23,6 +23,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import nethttp
+
 _API = "https://aoe4world.com/api/v0"
 # Relic's official replay endpoint; availability depends on the perspective
 # profile_id, so a match is probed against both players before giving up.
@@ -153,19 +155,21 @@ def _get_json(url: str, retries: int = 3, timeout: int = 15, strict: bool = Fals
     detail = "couldn't reach aoe4world"
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": _UA})  # noqa: S310
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None  # not found is a real (empty) answer, not a failure
-            detail = (
-                _RATE_LIMIT_MSG
-                if exc.code == 429
-                else f"aoe4world returned an error (HTTP {exc.code})"
-            )
-        except Exception:  # noqa: BLE001 - network/timeout/parse: treat as a soft failure
+            status, body = nethttp.get(url, timeout=timeout, headers={"User-Agent": _UA})
+        except Exception:  # noqa: BLE001 - network/timeout: treat as a soft failure
             detail = "couldn't reach aoe4world (check your connection)"
+        else:
+            if status == 404:
+                return None  # not found is a real (empty) answer, not a failure
+            if status == 429:
+                detail = _RATE_LIMIT_MSG
+            elif status >= 400:
+                detail = f"aoe4world returned an error (HTTP {status})"
+            else:
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    detail = "couldn't reach aoe4world (unexpected response)"
         if attempt + 1 < retries:
             time.sleep(1.2 * (2**attempt))
     if strict:
