@@ -2625,6 +2625,37 @@ class Panel(ctk.CTk):
             "<Double-Button-1>", self._header_art_double_click
         )
 
+        # Window controls (info / minimise / maximise / close) are painted into the
+        # backdrop bitmap. Overlay a small Canvas on that strip showing the exact same
+        # pixels (so it's invisible normally) and draw a soft square frame only under
+        # the pointer — modern hover feedback the flat bitmap can't give on its own.
+        self._chrome_strip_w = 250  # rightmost slice of the 1600-wide backdrop
+        self._chrome_hover_region: str | None = None
+        self._chrome_photo_cache: dict[bool, dict[str, ImageTk.PhotoImage]] = {}
+        self._chrome_bg_item: int | None = None
+        # Per-control geometry in the strip's own coordinates (backdrop x - 1350):
+        # name, x-centre of the baked icon, its bounding box (lifted up on render),
+        # a clean x to copy over the vacated spot, and the action. From a backdrop scan.
+        self._chrome_buttons = [
+            ("info", 26, (13, 28, 39, 52), 63, self._show_info),
+            ("min", 106, (98, 37, 116, 46), 128, self._minimize_window),
+            ("max", 158, (149, 29, 167, 51), 179, self._toggle_maximize_window),
+            ("close", 210, (201, 32, 219, 46), 231, self._on_close),
+        ]
+        self.header_controls = tk.Canvas(
+            header, width=self._chrome_strip_w, height=66,
+            bg=BG, bd=0, highlightthickness=0,
+        )
+        self.header_controls.place(relx=1.0, x=-1, y=-5, anchor="ne")
+        self._draw_chrome_backdrop()
+        self.header_controls.bind("<Motion>", self._on_chrome_motion)
+        self.header_controls.bind("<Leave>", self._on_chrome_leave)
+        self.header_controls.bind("<ButtonPress-1>", self._on_chrome_click)
+        self.header_controls.bind("<B1-Motion>", self._drag_titlebar, add="+")
+        self.header_controls.bind(
+            "<Double-Button-1>", self._header_art_double_click, add="+"
+        )
+
         # CTk's "transparent" child widgets repaint their parent's flat
         # ``fg_color``; they do not reveal bitmap content underneath.  That made
         # the three navigation buttons look like dark rectangular patches over
@@ -2805,9 +2836,10 @@ class Panel(ctk.CTk):
         )
         # Tiny "✕" box (info-button style) right next to the download progress;
         # hidden until a cancellable download is running (see _show_cancel).
+        self._cancel_x_image = self._x_glyph_image(22)  # kept referenced so it survives
         self._cancel_button = ctk.CTkButton(
-            self.tabs_shell, text="×", width=22, height=32,
-            font=theme.font(11, weight="bold"), command=self._cancel_download,
+            self.tabs_shell, text="", image=self._cancel_x_image,  # centred drawn ✕
+            width=32, height=32, command=self._cancel_download,  # square
             **theme.button_style("danger"),
         )
         self.tab_content = ctk.CTkFrame(self.tabs_shell, fg_color=PANEL, corner_radius=0)
@@ -3554,6 +3586,24 @@ class Panel(ctk.CTk):
         self._cancel_button.place(relx=1.0, x=-54, y=y, anchor="ne")
         self._cancel_button.lift()
 
+    def _x_glyph_image(
+        self, size: int = 22, stroke: float = 3.4, color: str = TEXT
+    ) -> ctk.CTkImage:
+        """A crisp, centred ✕ drawn as an image so the cancel button's glyph is
+        pixel-centred and sized independently of any font's vertical metrics (a
+        large ``×`` character sits low and stretches the button instead)."""
+        from PIL import ImageDraw
+
+        ss = 4  # supersample for smooth diagonals, then shrink
+        s = size * ss
+        m = int(s * 0.16)
+        w = max(1, int(stroke * ss))
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.line((m, m, s - m, s - m), fill=color, width=w)
+        draw.line((s - m, m, m, s - m), fill=color, width=w)
+        return ctk.CTkImage(img.resize((size, size), Image.LANCZOS), size=(size, size))
+
     def _header_nav_geometry(
         self,
     ) -> tuple[tuple[str, int, int], ...]:
@@ -3672,6 +3722,109 @@ class Panel(ctk.CTk):
         image = self._asset_image(filename, (1600, 112))
         if image is not None:
             self.header_art.configure(image=image)
+        self._draw_chrome_backdrop()  # keep the controls overlay in sync with the state
+
+    _CHROME_LIFT = 0        # keep the controls where they're baked (no repositioning)
+    _CHROME_ICON_CY = 40    # baked vertical centre of the icons within the strip
+    _CHROME_GLOW_W = 46     # equal hover-cell size (frameless background brighten)
+    _CHROME_GLOW_H = 40
+    _CHROME_GLOW_ALPHA = 32  # 0-255: subtle, like a modern title-bar button hover
+
+    def _chrome_backdrop_name(self) -> str:
+        return (
+            "theme/header-backdrop-maximized.png"
+            if self._window_maximized
+            else "theme/header-backdrop.png"
+        )
+
+    def _chrome_photos(self) -> dict[str, ImageTk.PhotoImage]:
+        """Build (and cache per maximize state) the strip images: a ``base`` with the
+        controls lifted, plus one variant per control with a soft frameless glow
+        composited behind it. Swapping these gives modern hover with no seams."""
+        state = self._window_maximized
+        cached = self._chrome_photo_cache.get(state)
+        if cached is not None:
+            return cached
+        from PIL import Image, ImageDraw
+
+        lift = self._CHROME_LIFT
+        strip = (
+            Image.open(ASSET_DIR / self._chrome_backdrop_name())
+            .convert("RGBA")
+            .crop((1600 - self._chrome_strip_w, 0, 1600, 66))
+            .copy()
+        )
+        if lift:  # optionally raise the baked icons; disabled (lift=0) keeps them exact
+            icons = [strip.crop(box) for _n, _cx, box, _s, _a in self._chrome_buttons]
+            for (_n, _cx, box, esrc, _a), icon in zip(
+                self._chrome_buttons, icons, strict=True
+            ):
+                x0, y0, x1, y1 = box
+                # Erase the baked icon with a clean same-row patch, then repaste only
+                # its glyph (a luminance mask drops the dark local background) higher.
+                strip.paste(strip.crop((esrc, y0, esrc + (x1 - x0), y1)), (x0, y0))
+                mask = icon.convert("L").point(
+                    lambda v: 0 if v < 40 else min(255, (v - 40) * 3)
+                )
+                strip.paste(icon, (x0, y0 - lift), mask)
+        photos = {"base": ImageTk.PhotoImage(strip, master=self.header_controls)}
+        cy = self._CHROME_ICON_CY - lift
+        gw, gh = self._CHROME_GLOW_W, self._CHROME_GLOW_H
+        for name, cx, _box, _s, _a in self._chrome_buttons:
+            overlay = Image.new("RGBA", strip.size, (0, 0, 0, 0))
+            ImageDraw.Draw(overlay).rounded_rectangle(
+                (cx - gw / 2, cy - gh / 2, cx + gw / 2, cy + gh / 2),
+                radius=9, fill=(255, 255, 255, self._CHROME_GLOW_ALPHA),
+            )
+            merged = Image.alpha_composite(strip, overlay)
+            photos[name] = ImageTk.PhotoImage(merged, master=self.header_controls)
+        self._chrome_photo_cache[state] = photos
+        return photos
+
+    def _draw_chrome_backdrop(self) -> None:
+        """Show the base strip, or the hovered control's glow variant."""
+        if not hasattr(self, "header_controls"):
+            return
+        with contextlib.suppress(Exception):
+            photos = self._chrome_photos()
+            photo = photos.get(self._chrome_hover_region or "base", photos["base"])
+            if self._chrome_bg_item is None:
+                self._chrome_bg_item = self.header_controls.create_image(
+                    0, 0, anchor="nw", image=photo
+                )
+            else:
+                self.header_controls.itemconfigure(self._chrome_bg_item, image=photo)
+            self.header_controls._chrome_ref = photo  # keep a reference alive
+
+    def _chrome_region_at(self, x: float, y: float) -> str | None:
+        cy = self._CHROME_ICON_CY - self._CHROME_LIFT
+        if abs(y - cy) > self._CHROME_GLOW_H / 2:
+            return None
+        for name, cx, _box, _s, _a in self._chrome_buttons:
+            if abs(x - cx) <= self._CHROME_GLOW_W / 2:
+                return name
+        return None
+
+    def _on_chrome_motion(self, event: tk.Event) -> None:
+        region = self._chrome_region_at(event.x, event.y)
+        self.header_controls.configure(cursor="hand2" if region else "arrow")
+        if region != self._chrome_hover_region:
+            self._chrome_hover_region = region
+            self._draw_chrome_backdrop()
+
+    def _on_chrome_leave(self, _event: tk.Event) -> None:
+        if self._chrome_hover_region is not None:
+            self._chrome_hover_region = None
+            self._draw_chrome_backdrop()
+
+    def _on_chrome_click(self, event: tk.Event) -> str | None:
+        region = self._chrome_region_at(event.x, event.y)
+        for name, _cx, _box, _s, action in self._chrome_buttons:
+            if name == region:
+                action()
+                return "break"
+        self._start_title_drag(event)  # empty strip acts like the title bar
+        return None
 
     def _align_header_nav_background(self, header_width: int | None = None) -> None:
         """Align the Canvas crop with the identically placed header bitmap."""
