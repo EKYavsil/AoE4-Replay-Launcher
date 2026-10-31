@@ -339,10 +339,18 @@ CIV_IMAGES = {
     "OOD": "Order_of_the_Dragon_AoE4.png",
     "OTT": "Ottomans_AoE4.png",
     "RUS": "Rus_AoE4.png",
+    "SCO": "Scots_AoE4.png",
     "SEN": "Sengoku_Daimyo_AoE4.png",
+    "VIK": "Vikings_AoE4.png",
     "TMP": "Knights_Templar_campaign_AoE4.png",
     "TUG": "Tughlaq_Dynasty_AoE4.png",
     "ZXL": "Zhu_Xis_Legacy_AoE4.png",
+}
+
+# Per-civ render scale (keyed by the CIV_IMAGES code). The Vikings banner's near-black
+# field reads smaller than the bright flags next to it; nudge it up so it matches.
+CIV_IMAGE_SCALE = {
+    "VIK": 1.10,
 }
 
 LEAGUE_IMAGES = {
@@ -1158,6 +1166,10 @@ class Panel(ctk.CTk):
         # check for a newer app release in the background (Velopack auto-update)
         threading.Thread(target=self._check_for_updates, daemon=True).start()
         self._start_game_watch()  # lock Play/Delete while AoE4 is open (registry watch)
+        # An always-on, per-hover-independent backstop for a stranded roster tooltip
+        # (see _roster_tip_watchdog): the per-show poll can die and leave a tip up
+        # forever; this loop lives for the whole session and can always reclaim it.
+        self._roster_tip_watchdog_job = self.after(1000, self._roster_tip_watchdog)
 
     # ---- Steam sign-in ----------------------------------------------------
 
@@ -4631,7 +4643,12 @@ class Panel(ctk.CTk):
         self, civ: str | None, size: tuple[int, int] = (38, 28)
     ) -> ctk.CTkImage | None:
         filename = CIV_IMAGES.get(civ or "")
-        return self._asset_image(f"flags/{filename}", size) if filename else None
+        if not filename:
+            return None
+        scale = CIV_IMAGE_SCALE.get(civ or "", 1.0)
+        if scale != 1.0:
+            size = (round(size[0] * scale), round(size[1] * scale))
+        return self._asset_image(f"flags/{filename}", size)
 
     def _league_image(self, rank: str) -> ctk.CTkImage | None:
         try:
@@ -5369,6 +5386,7 @@ class Panel(ctk.CTk):
         tip.deiconify()
         tip.lift()
         self._roster_tip_src = widget
+        self._roster_tip_shown = True  # our intent — poll keys off this, not winfo_viewable
         self._roster_tip_deadline = time.monotonic() + 15.0  # last-resort auto-hide cap
         if getattr(self, "_roster_tip_poll", None) is None:
             self._roster_tip_poll = self.after(120, self._poll_roster_tip)
@@ -5405,12 +5423,18 @@ class Panel(ctk.CTk):
             return False
 
     def _poll_roster_tip(self) -> None:
-        """Safety net for a missed <Leave>: hide once the pointer is no longer over
-        the source name. A hard deadline is the last resort if even this is fooled."""
+        """Fast (120 ms) safety net for a missed <Leave>: hide once the pointer is no
+        longer over the source name. Keyed off ``_roster_tip_shown`` (our own intent),
+        never ``winfo_viewable()`` — right after ``deiconify`` the window can briefly
+        report not-viewable, and stopping on that used to strand the tip with nothing
+        (not even the deadline, checked only here) left to reclaim it. The always-on
+        ``_roster_tip_watchdog`` is the independent backstop if this loop ever stops."""
         self._roster_tip_poll = None
+        if not getattr(self, "_roster_tip_shown", False):
+            return  # genuinely hidden — stop polling until the next show
         tip = getattr(self, "_roster_tip", None)
-        if tip is None or not tip.winfo_exists() or not tip.winfo_viewable():
-            return  # already hidden — stop polling until the next show
+        if tip is None or not tip.winfo_exists():
+            return
         if time.monotonic() >= getattr(self, "_roster_tip_deadline", 0.0):
             self._hide_roster_tip()  # absolute cap — never linger past the deadline
             return
@@ -5419,7 +5443,29 @@ class Panel(ctk.CTk):
         else:
             self._hide_roster_tip()
 
+    def _roster_tip_watchdog(self) -> None:
+        """Session-long backstop, independent of the per-show poll. Runs every second
+        for the app's whole life, so even if ``_poll_roster_tip`` ever stops while a
+        tip is up (the cause of a tip stranded until the app closes), this reclaims it
+        within ~1 s. Cheap: it does real work only while a tip is actually visible."""
+        try:
+            tip = getattr(self, "_roster_tip", None)
+            if (
+                getattr(self, "_roster_tip_shown", False)
+                and tip is not None
+                and tip.winfo_exists()
+                and tip.winfo_viewable()
+                and (
+                    time.monotonic() >= getattr(self, "_roster_tip_deadline", 0.0)
+                    or not self._pointer_over_src()
+                )
+            ):
+                self._hide_roster_tip()
+        finally:
+            self._roster_tip_watchdog_job = self.after(1000, self._roster_tip_watchdog)
+
     def _hide_roster_tip(self) -> None:
+        self._roster_tip_shown = False  # tells the poll/watchdog it's intentionally gone
         poll = getattr(self, "_roster_tip_poll", None)
         if poll is not None:
             with contextlib.suppress(Exception):
@@ -5508,7 +5554,11 @@ class Panel(ctk.CTk):
 
     def _canvas_civ_photo(self, civ: str | None) -> tk.PhotoImage | None:
         filename = CIV_IMAGES.get(civ or "")
-        return self._canvas_photo(f"flags/{filename}", (38, 28)) if filename else None
+        if not filename:
+            return None
+        scale = CIV_IMAGE_SCALE.get(civ or "", 1.0)
+        size = (round(38 * scale), round(28 * scale))
+        return self._canvas_photo(f"flags/{filename}", size)
 
     def _canvas_country_photo(self, country: str) -> tk.PhotoImage | None:
         code = country.strip().lower()
@@ -8007,6 +8057,10 @@ class Panel(ctk.CTk):
 
     def _on_close(self) -> None:
         self._cancel_window_resize()
+        watchdog = getattr(self, "_roster_tip_watchdog_job", None)
+        if watchdog is not None:  # stop the session-long roster-tip backstop loop
+            with contextlib.suppress(Exception):
+                self.after_cancel(watchdog)
         if self._game_watcher is not None:  # wake the registry-watch thread so it exits
             with contextlib.suppress(Exception):
                 self._game_watcher.stop()

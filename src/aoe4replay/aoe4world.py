@@ -79,6 +79,8 @@ _CIV_ABBREV = {
     "order_of_the_dragon": "OOD",
     "ottomans": "OTT",
     "rus": "RUS",
+    "scots": "SCO",
+    "vikings": "VIK",
     "zhu_xis_legacy": "ZXL",
 }
 
