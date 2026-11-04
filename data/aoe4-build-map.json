@@ -978,7 +978,7 @@
     {
         "name": "2026-10-29-live",
         "validFrom": "2026-10-29T17:09:06",
-        "validTo": null,
+        "validTo": "2026-11-03T22:52:50",
         "buildId": "2026-10-29-live",
         "installDir": null,
         "depots": [
@@ -988,5 +988,19 @@
             }
         ],
         "version": 12182
+    },
+    {
+        "name": "2026-11-03-live",
+        "validFrom": "2026-11-03T22:52:50",
+        "validTo": null,
+        "buildId": "2026-11-03-live",
+        "installDir": null,
+        "depots": [
+            {
+                "id": "1466861",
+                "manifest": "5657290468620850810"
+            }
+        ],
+        "version": 12260
     }
 ]
