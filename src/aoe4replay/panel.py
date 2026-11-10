@@ -95,9 +95,12 @@ from . import (  # noqa: E402
     aoe4world,
     buildcache,
     config,
+    customgames,
     launch,
+    modnames,
     nethttp,
     replay,
+    replaymods,
     service,
     steamqr,
 )
@@ -149,6 +152,10 @@ ASSET_DIR = Path(__file__).with_name("assets")
 # The four information columns retain their established proportions, PLAYERS
 # absorbs the remaining right-hand space, and ACTION keeps a safe minimum.
 RESULT_COLUMN_WEIGHTS = (16, 10, 12, 9)
+# Same four slots with MAP collapsed to nothing, so the surfaces that cannot
+# name a map keep every other column index — and every x coordinate the
+# shared row renderer depends on — exactly where they are.
+RESULT_COLUMN_WEIGHTS_NO_MAP = (16, 10, 0, 9)
 RESULT_COLUMN_WIDTH = 120.0
 RESULT_ACTION_FRACTION = 0.12
 RESULT_ACTION_MIN_WIDTH = 156.0
@@ -161,6 +168,7 @@ def _result_column_bounds(
     width: int,
     *,
     include_result: bool = True,
+    include_map: bool = True,
 ) -> tuple[tuple[float, float], ...]:
     """Return the canonical Profile Games column bounds for a canvas width.
 
@@ -185,10 +193,11 @@ def _result_column_bounds(
     result_left = result_center - result_half
     result_right = result_center + result_half
     table_width = max(0.0, result_left - left)
-    weight_total = float(sum(RESULT_COLUMN_WEIGHTS))
+    weights = RESULT_COLUMN_WEIGHTS if include_map else RESULT_COLUMN_WEIGHTS_NO_MAP
+    weight_total = float(sum(weights))
     bounds: list[tuple[float, float]] = []
     cursor = left
-    for weight in RESULT_COLUMN_WEIGHTS:
+    for weight in weights:
         next_cursor = cursor + table_width * weight / weight_total
         bounds.append((cursor, next_cursor))
         cursor = next_cursor
@@ -300,6 +309,19 @@ def _gold_text_raster(
     )
 
 INFO_GITHUB_URL = "https://github.com/EKYavsil/AoE4-Replay-Launcher"
+
+# Tabs whose match count and loading state are reported through the shared
+# `p_status` label in the toolbar's counter slot. Only one of them is ever on
+# screen, so they can share the label — but every stage of the notification
+# path has to agree on the list, which is why it lives here rather than being
+# spelled out at each gate.
+_COUNTER_TABS = ("Profile games", "Custom games")
+
+# How long after a list's contents change no hover may open. Hit regions are
+# rebuilt the instant rows are drawn, and the pointer is often already resting
+# where one lands — right after clicking Search, for instance. Opening the first
+# tip into that half-settled surface is what could leave one behind.
+_HOVER_SETTLE_SECONDS = 2.0
 
 # Game-mode filter: dropdown label -> aoe4world `leaderboard` value (None = no filter,
 # applied server-side alongside the date `since`). FFA is quick-match only in AoE4
@@ -706,6 +728,7 @@ class VirtualListCanvas(tk.Frame):
         return key in self._keys
 
     def set_items(self, items, *, renderer=None, row_height: int | None = None) -> None:
+        self.owner._disarm_hover()
         self._clear_hover()
         self.items = list(items)
         self._keys = {
@@ -1068,7 +1091,11 @@ class Panel(ctk.CTk):
         self._suggest_token = 0  # bumped per name search; guards the async flag refresh
         self._info_window: ctk.CTkToplevel | None = None
         self._active_tab = "Profile games"
+        self._hover_armed_at = 0.0  # no tip may open before this monotonic time
         # profile-games tab paging state
+        # Custom tab: one profile, one unpaginated server-capped list.
+        self._cg_profile: int | None = None
+        self._cg_searching = False
         self._pg_profile: int | None = None
         self._pg_page = 0  # currently displayed page
         self._pg_start_page = 1  # first page of the view (date-jump aware); Prev stops here
@@ -1106,6 +1133,11 @@ class Panel(ctk.CTk):
         # restore mods if a previous session was force-closed while a replay ran
         with contextlib.suppress(Exception):
             launch.recover_user_mods(self.cfg)
+        # Read the titles out of every mod archive on disk, so a later refusal can
+        # name what it is missing without asking the network. Costs nothing and
+        # covers mods that are no longer installed.
+        with contextlib.suppress(Exception):
+            modnames.harvest_local(self.cfg)
         # if the app was moved/updated, re-point the persistent Steam shim at the live exe
         with contextlib.suppress(Exception):
             launch.heal_wrapper_paths(self.cfg)
@@ -2417,17 +2449,23 @@ class Panel(ctk.CTk):
         # remaining width.
         if density_changed:
             self.notification_count_slot.configure(width=200 if compact else 240)
-            self.p_status.configure(
-                width=188 if compact else 228,
-                wraplength=178 if compact else 218,
-            )
+            for counter in (self.p_status, getattr(self, "c_status", None)):
+                if counter is not None:
+                    counter.configure(
+                        width=188 if compact else 228,
+                        wraplength=178 if compact else 218,
+                    )
             self._place_notification_bar(compact=compact)
         if compact:
             if nav_changed:
-                self.header_nav.configure(width=600)
-                self.header_nav.place_configure(relx=0.5, x=0)
-                self._draw_header_navigation()
-                self._align_header_nav_background(event.width)
+                # The 500 px brand lockup is hidden at this density, so the four-tab
+                # canvas can stay centred — except near the 1180 px minimum window,
+                # where centring would slide its right edge under the window
+                # controls. Nudge left by exactly the overlap, and only then.
+                slack = (
+                    (event.width - self._chrome_strip_w) - (event.width / 2 + 390) - 8
+                )
+                self._place_header_nav(min(0, round(slack)), event.width)
             if density_changed:
                 self.reference_brand_label.place_forget()
                 self._set_scrollbar_visible(
@@ -2461,14 +2499,12 @@ class Panel(ctk.CTk):
                 self.brand_subtitle_label.place_configure(x=112, y=62)
         else:
             if nav_changed:
-                if compact_nav:
-                    self.header_nav.configure(width=600)
-                    self.header_nav.place_configure(relx=0.5, x=0)
-                else:
-                    self.header_nav.configure(width=760)
-                    self.header_nav.place_configure(relx=0.5, x=-44)
-                self._draw_header_navigation()
-                self._align_header_nav_background(event.width)
+                # The brand lockup occupies x 0-500 whatever the window width, so
+                # the nav is nudged right by however much centring would push its
+                # first title under it — which is nothing once the window is wide
+                # enough, where the original -44 reference offset takes over again.
+                offset = max(-44, round(886 - event.width / 2))
+                self._place_header_nav(offset, event.width)
             if density_changed:
                 self.reference_brand_label.place(x=0, y=-5)
                 self.reference_brand_label.lift()
@@ -2674,9 +2710,10 @@ class Panel(ctk.CTk):
         # the textured header.  Keep the backdrop, lettering and active rule on
         # one native Canvas instead, where PNG alpha is composited correctly.
         self._header_nav_parent = header
+        self._header_nav_offset = 0
         self.header_nav = tk.Canvas(
             header,
-            width=600,
+            width=780,
             height=72,
             bg=BG,
             bd=0,
@@ -2701,6 +2738,7 @@ class Panel(ctk.CTk):
         self._tab_inactive_images: dict[str, tk.PhotoImage | None] = {}
         tab_titles = {
             "Profile games": "Profile Games",
+            "Custom games": "Custom Games",
             "Head-to-head": "Head to Head",
             "Saved builds": "Saved Builds",
         }
@@ -2857,16 +2895,19 @@ class Panel(ctk.CTk):
         self.tab_content = ctk.CTkFrame(self.tabs_shell, fg_color=PANEL, corner_radius=0)
         self.tab_content.pack(fill="both", expand=True)
         self.profile_tab = ctk.CTkFrame(self.tab_content, fg_color=PANEL, corner_radius=0)
+        self.custom_tab = ctk.CTkFrame(self.tab_content, fg_color=PANEL, corner_radius=0)
         self.h2h_tab = ctk.CTkFrame(self.tab_content, fg_color=PANEL, corner_radius=0)
         self.saved_tab = ctk.CTkFrame(self.tab_content, fg_color=PANEL, corner_radius=0)
         for textured_tab in (
             self.tab_content,
             self.profile_tab,
+            self.custom_tab,
             self.h2h_tab,
             self.saved_tab,
         ):
             self._texture_frame(textured_tab)
         self._build_profile_tab(self.profile_tab)
+        self._build_custom_tab(self.custom_tab)
         self._build_h2h_tab(self.h2h_tab)
         self._build_saved_tab(self.saved_tab)
         self._switch_tab("Profile games")
@@ -3406,6 +3447,7 @@ class Panel(ctk.CTk):
             self._refresh_saved_builds()
         for tab_name, frame in (
             ("Profile games", self.profile_tab),
+            ("Custom games", self.custom_tab),
             ("Head-to-head", self.h2h_tab),
             ("Saved builds", self.saved_tab),
         ):
@@ -3430,6 +3472,17 @@ class Panel(ctk.CTk):
         if self._cancel_visible:
             self._place_cancel_button()
 
+    def _counter_label(self):
+        """The counter label belonging to the visible tab, or None for the rest.
+
+        Profile Games and Custom each own one and share the toolbar slot; without
+        this, whichever searched last would have its count read as the other's.
+        """
+        return {
+            "Profile games": getattr(self, "p_status", None),
+            "Custom games": getattr(self, "c_status", None),
+        }.get(getattr(self, "_active_tab", "Profile games"))
+
     def _show_profile_status(self) -> None:
         """Expose profile status only when no newer notification has replaced it."""
 
@@ -3444,8 +3497,13 @@ class Panel(ctk.CTk):
                 padx=(5, 5),
                 before=self.notification_cancel_slot,
             )
-        if not self.p_status.winfo_manager():
-            self.p_status.pack(fill="both", expand=True, padx=2, pady=3)
+        active = self._counter_label()
+        for label in (getattr(self, "p_status", None), getattr(self, "c_status", None)):
+            if label is None or label is active:
+                continue
+            label.pack_forget()
+        if active is not None and not active.winfo_manager():
+            active.pack(fill="both", expand=True, padx=2, pady=3)
         self._render_toolbar_notice()
 
     def _profile_status_changed(self, text: str) -> None:
@@ -3453,7 +3511,7 @@ class Panel(ctk.CTk):
 
         if text:
             self._clear_inline_notifications()
-            if getattr(self, "_active_tab", "Profile games") == "Profile games":
+            if getattr(self, "_active_tab", "Profile games") in _COUNTER_TABS:
                 self._show_profile_status()
         else:
             self.notification_count_slot.pack_forget()
@@ -3502,9 +3560,8 @@ class Panel(ctk.CTk):
             return
         stack.pack_forget()
         if (
-            getattr(self, "_active_tab", "Profile games") == "Profile games"
-            and hasattr(self, "p_status")
-            and self.p_status.winfo_manager()
+            (counter := self._counter_label()) is not None
+            and str(counter.cget("text"))
         ):
             self._show_profile_status()
         else:
@@ -3514,6 +3571,7 @@ class Panel(ctk.CTk):
     def _notice_surface(self) -> ctk.CTkFrame | None:
         return {
             "Profile games": getattr(self, "profile_search_bar", None),
+            "Custom games": getattr(self, "custom_search_bar", None),
             "Head-to-head": getattr(self, "h2h_search_bar", None),
             "Saved builds": getattr(self, "saved_section_bar", None),
         }.get(getattr(self, "_active_tab", "Profile games"))
@@ -3581,12 +3639,11 @@ class Panel(ctk.CTk):
             label = getattr(self, channel)
             text = self._notification_texts[channel]
         elif (
-            getattr(self, "_active_tab", "Profile games") == "Profile games"
-            and hasattr(self, "p_status")
-            and self.p_status.winfo_manager()
+            (counter := self._counter_label()) is not None
+            and str(counter.cget("text"))
         ):
-            label = self.p_status
-            text = str(self.p_status.cget("text"))
+            label = counter
+            text = str(counter.cget("text"))
         else:
             label = self.status
             text = ""
@@ -3619,18 +3676,20 @@ class Panel(ctk.CTk):
     def _header_nav_geometry(
         self,
     ) -> tuple[tuple[str, int, int], ...]:
-        """Return the reference-aligned hit/rule bounds for each header tab."""
+        """Return the reference-aligned hit/rule bounds for each header tab.
 
-        if int(self.header_nav.cget("width")) <= 600:
-            return (
-                ("Profile games", 8, 192),
-                ("Head-to-head", 208, 392),
-                ("Saved builds", 408, 592),
-            )
+        Four 25 px titles carry 668 px of lettering, so the slots no longer share
+        one fixed width: each hugs its own title plus 8 px, with 22 px between
+        them, inside a 780 px canvas. There is a single table because clearing
+        the 500 px brand lockup is now the canvas *offset*'s job (see
+        ``_header_nav_parent_configure``) rather than a wider first margin.
+        """
+
         return (
-            ("Profile games", 27, 265),
-            ("Head-to-head", 300, 548),
-            ("Saved builds", 564, 752),
+            ("Profile games", 6, 183),
+            ("Custom games", 205, 393),
+            ("Head-to-head", 415, 586),
+            ("Saved builds", 608, 772),
         )
 
     def _draw_header_navigation(self) -> None:
@@ -3838,6 +3897,14 @@ class Panel(ctk.CTk):
         self._start_title_drag(event)  # empty strip acts like the title bar
         return None
 
+    def _place_header_nav(self, offset: int, header_width: int) -> None:
+        """Place the nav canvas, keeping its backdrop crop in step."""
+
+        self._header_nav_offset = offset
+        self.header_nav.place_configure(relx=0.5, x=offset)
+        self._draw_header_navigation()
+        self._align_header_nav_background(header_width)
+
     def _align_header_nav_background(self, header_width: int | None = None) -> None:
         """Align the Canvas crop with the identically placed header bitmap."""
 
@@ -3845,7 +3912,7 @@ class Panel(ctk.CTk):
             return
         width = header_width or self._header_nav_parent.winfo_width()
         nav_width = int(self.header_nav.cget("width"))
-        nav_offset = 0 if nav_width <= 600 else -44
+        nav_offset = getattr(self, "_header_nav_offset", 0)
         nav_left = round(width * 0.5 + nav_offset - nav_width / 2)
         backdrop_left = width - 1 - 1600
         self.header_nav.coords(
@@ -3865,7 +3932,7 @@ class Panel(ctk.CTk):
                 return
 
     def _header_nav_step(self, delta: int) -> None:
-        tabs = ("Profile games", "Head-to-head", "Saved builds")
+        tabs = ("Profile games", "Custom games", "Head-to-head", "Saved builds")
         index = (tabs.index(self._active_tab) + delta) % len(tabs)
         self._switch_tab(tabs[index])
 
@@ -4817,6 +4884,8 @@ class Panel(ctk.CTk):
         row: tk.Canvas,
         *,
         include_result: bool = True,
+        include_map: bool = True,
+        lobby_column: bool = False,
     ) -> None:
         """Draw headings from the exact same bounds used by virtual rows."""
 
@@ -4836,13 +4905,18 @@ class Panel(ctk.CTk):
                     image=texture,
                     tags="header_dynamic",
                 )
-        bounds = _result_column_bounds(width, include_result=include_result)
+        bounds = _result_column_bounds(
+            width, include_result=include_result, include_map=include_map
+        )
         headings = [
             (0, "DATE (UTC)", 15),
-            (1, "MODE", 14),
-            (2, "MAP", 14),
+            # "LOBBY", not "PLAYERS": column 5 already carries that heading, and
+            # this one is the lobby's size rather than the matchup.
+            (1, "LOBBY" if lobby_column else "MODE", 14),
             (3, "DURATION", 14),
         ]
+        if include_map:
+            headings.insert(2, (2, "MAP", 14))
         if include_result:
             headings.append((4, "RESULT", 14))
         headings.extend(((5, "PLAYERS", 14), (6, "ACTION", 14)))
@@ -4866,6 +4940,8 @@ class Panel(ctk.CTk):
         parent: ctk.CTkFrame,
         *,
         include_result: bool = True,
+        include_map: bool = True,
+        lobby_column: bool = False,
     ) -> tk.Canvas:
         row = tk.Canvas(
             parent,
@@ -4880,12 +4956,84 @@ class Panel(ctk.CTk):
         row.pack(fill="x", padx=14, pady=(3, 0))
         row.bind(
             "<Configure>",
-            lambda _event, canvas=row, result=include_result: self._draw_column_header(
-                canvas,
-                include_result=result,
+            lambda _event, canvas=row, result=include_result, mapped=include_map,
+            lobby=lobby_column: (
+                self._draw_column_header(
+                    canvas,
+                    include_result=result,
+                    include_map=mapped,
+                    lobby_column=lobby,
+                )
             ),
         )
         return row
+
+    def _build_custom_tab(self, parent: ctk.CTkFrame) -> None:
+        """Custom-lobby games for one profile.
+
+        Deliberately narrower than Profile Games: the official endpoint serves at
+        most ten matches per profile and ignores ``page``, ``recordCount`` and
+        ``sortDirection``, so there is nothing for a pager to page through and no
+        date range the server could honour. Offering either control would promise
+        reach the API does not have.
+        """
+
+        self.custom_search_bar = ctk.CTkFrame(
+            parent, height=90, **theme.panel_style(strong=True)
+        )
+        top = self.custom_search_bar
+        top.pack(fill="x", padx=38, pady=(7, 7))
+        top.pack_propagate(False)
+        self._texture_frame(top)
+        self.c_entry = self._entry(top, "Profile ID or player name", 357)
+        self.c_entry.pack(side="left", padx=(23, 0), pady=19)
+        self.c_entry.bind("<Return>", lambda _e: self.on_custom_search())
+        self.c_search_btn = self._accent_button(
+            top, "Search", 138, self.on_custom_search, icon_name="search"
+        )
+        self.c_search_btn.pack(side="left", padx=0, pady=19)
+        for control in (self.c_entry, self.c_search_btn):
+            control.configure(height=48, corner_radius=0)
+
+        games_shell = ctk.CTkFrame(parent, **theme.panel_style(strong=True))
+        games_shell.pack(fill="both", expand=True, padx=24, pady=(0, 9))
+        self._texture_frame(games_shell)
+        section = self._section_bar(games_shell, "swords", "Custom games")
+        self.c_refresh_btn = ctk.CTkButton(
+            section,
+            text="",
+            image=self._gold_asset_image("theme/icon-refresh.png", (28, 28)),
+            width=55,
+            height=44,
+            command=self._refresh_custom,
+            **theme.button_style("gold"),
+        )
+        self.c_status = SwitchingLabel(
+            self.notification_count_slot,
+            on_text_change=self._profile_status_changed,
+            text="",
+            width=228,
+            height=40,
+            font=self.font_bold,
+            text_color=GOLD_BRIGHT,
+            fg_color="transparent",
+            corner_radius=0,
+            anchor="e",
+            justify="center",
+            wraplength=218,
+        )
+        self.c_column_header = self._column_header(
+            games_shell, include_map=False, lobby_column=True
+        )
+        self.custom_list = VirtualListCanvas(
+            games_shell,
+            self,
+            self._draw_game_row,
+            row_height=64,
+        )
+        self.custom_list.pack(fill="both", expand=True, padx=14, pady=(0, 4))
+        self._set_scrollbar_visible(self.custom_list, False)
+        theme.add_corner_ornaments(games_shell, bg=theme.PANEL_ALT)
 
     def _build_profile_tab(self, parent: ctk.CTkFrame) -> None:
         self.profile_search_bar = ctk.CTkFrame(
@@ -5341,6 +5489,8 @@ class Panel(ctk.CTk):
         *,
         canvas_bounds: tuple[float, float, float, float] | None = None,
     ) -> None:
+        if self._hover_disarmed():
+            return
         tip = self._roster_tip_window()
         for child in tip.winfo_children():  # rebuild the content for this roster
             child.destroy()
@@ -5350,10 +5500,23 @@ class Panel(ctk.CTk):
             line = ctk.CTkFrame(frame, fg_color="transparent")
             line.pack(fill="x", padx=12, pady=3)
             flag = self._civ_image(player.get("civ"))
+            # The same empty 38x28 frame the rows use, so a flag and an abbreviation
+            # occupy an identical box and every line in the roster aligns.
+            badge = ctk.CTkFrame(
+                line,
+                width=38,
+                height=28,
+                fg_color="transparent",
+                border_width=1,
+                border_color=GOLD_DARK,
+                corner_radius=0,
+            )
+            badge.pack(side="left", padx=(0, 8))
+            badge.pack_propagate(False)
             ctk.CTkLabel(  # flag image, or the civ abbreviation when no flag exists
-                line, text="" if flag else (player.get("civ") or ""), image=flag,
-                width=34, text_color=MUTED, font=self.font_normal,
-            ).pack(side="left", padx=(0, 8))
+                badge, text="" if flag else (player.get("civ") or ""), image=flag,
+                text_color=MUTED, font=self.font_normal,
+            ).pack(fill="both", expand=True)
             ctk.CTkLabel(
                 line,
                 text=player["name"],
@@ -5390,6 +5553,18 @@ class Panel(ctk.CTk):
         self._roster_tip_deadline = time.monotonic() + 15.0  # last-resort auto-hide cap
         if getattr(self, "_roster_tip_poll", None) is None:
             self._roster_tip_poll = self.after(120, self._poll_roster_tip)
+
+    def _disarm_hover(self, seconds: float = _HOVER_SETTLE_SECONDS) -> None:
+        """Hide any open tip and refuse to open another until the surface settles.
+
+        Called whenever a list's contents are replaced, so it covers every tab and
+        both kinds of hover (canvas rows and the bound card labels) from one place.
+        """
+        self._hover_armed_at = time.monotonic() + max(0.0, seconds)
+        self._hide_roster_tip()
+
+    def _hover_disarmed(self) -> bool:
+        return time.monotonic() < getattr(self, "_hover_armed_at", 0.0)
 
     def _pointer_over_src(self) -> bool:
         """True only if the pointer is over the source name — or one of its internal
@@ -5454,7 +5629,11 @@ class Panel(ctk.CTk):
                 getattr(self, "_roster_tip_shown", False)
                 and tip is not None
                 and tip.winfo_exists()
-                and tip.winfo_viewable()
+                # Deliberately NOT winfo_viewable(): a just-deiconified override-
+                # redirect window can report not-viewable while plainly on screen,
+                # and gating on it made this backstop weaker than the poll it
+                # exists to back up — the 15 s cap below included. _roster_tip_shown
+                # is our own intent and is the only trustworthy signal here.
                 and (
                     time.monotonic() >= getattr(self, "_roster_tip_deadline", 0.0)
                     or not self._pointer_over_src()
@@ -5644,10 +5823,34 @@ class Panel(ctk.CTk):
         font2 = self._canvas_player_font(str(summary.get("name2") or ""), size=17)
         color1 = GREEN if left_won else LOSS if result_known else TEXT
         color2 = GREEN if right_won else LOSS if result_known else TEXT
+        # A row may ask for the unknown marker to be spelled out — in the civ slot
+        # and in a missing opponent's name — instead of the silent gap that leaves
+        # the matchup looking truncated. Only rows that set the flag change.
+        mark_unknown = bool(summary.get("_mark_unknown_civ"))
+        # A placeholder is not a player: hold it in the same muted tone as the civ
+        # mark and the hover, rather than a win/loss colour that would read as a
+        # real opponent having won.
+        if mark_unknown:
+            # Colour *and* weight: the player font is bold, which would make the
+            # placeholder shout louder than the real name beside it.
+            if full_name1 == customgames.UNKNOWN:
+                color1, font1 = MUTED, self._canvas_font(17)
+            if full_name2 == customgames.UNKNOWN:
+                color2, font2 = MUTED, self._canvas_font(17)
         victory = self._canvas_photo("victory.png", (64, 48))
         replay_photo = self._canvas_photo("replay.png", (25, 28)) if replay_icon else None
         civ1 = self._canvas_civ_photo(summary.get("civ1"))
         civ2 = self._canvas_civ_photo(summary.get("civ2"))
+
+        def civ_piece(photo, key: str):
+            if photo is not None or not mark_unknown:
+                return ("image", photo, 44)
+            # No icon exists for this civ, so print the three letters instead —
+            # the same ones the hover's roster lines fall back to.
+            return ("civ_mark", str(summary.get(key) or customgames.UNKNOWN), 44)
+
+        civ1_piece = civ_piece(civ1, "civ1")
+        civ2_piece = civ_piece(civ2, "civ2")
         name1_width = self._canvas_text_width(name1, font1)
         name2_width = self._canvas_text_width(name2, font2)
         available = max(1, right - left)
@@ -5661,9 +5864,9 @@ class Panel(ctk.CTk):
             name_slot = round(min(130.0, remaining / 2))
             pieces = [
                 ("text1", name1, name_slot),
-                ("image", civ1, 44),
+                civ1_piece,
                 ("vs", "vs", 44),
-                ("image", civ2, 44),
+                civ2_piece,
                 ("text2", name2, name_slot),
             ]
         else:
@@ -5678,9 +5881,9 @@ class Panel(ctk.CTk):
             pieces.extend(
                 [
                     ("text1", name1, name1_width + 9),
-                    ("image", civ1, 44),
+                    civ1_piece,
                     ("vs", "vs", 44),
-                    ("image", civ2, 44),
+                    civ2_piece,
                     ("text2", name2, name2_width + 9),
                 ]
             )
@@ -5749,6 +5952,34 @@ class Panel(ctk.CTk):
                         ),
                         on_leave=self._hide_roster_tip,
                     )
+            elif kind == "civ_mark":
+                # An empty frame the exact size of a civ flag (38x28) with the
+                # abbreviation inside it, so the slot lines up with the real flags
+                # in the rows above and below instead of floating in a gap. Colour
+                # and font are the roster hover's own fallback, which already reads
+                # well, rather than the heavier "vs" lettering.
+                box_width, box_height = 38, 28
+                box_left = x + (piece_width - box_width) / 2
+                canvas.create_rectangle(
+                    box_left,
+                    center_y - box_height / 2,
+                    box_left + box_width,
+                    center_y + box_height / 2,
+                    fill="",
+                    # The theme's dark-gold rule colour, warm like the lettering
+                    # inside it; CARD_BORDER would read as a cold hole in the row.
+                    outline=GOLD_DARK,
+                    width=1,
+                    tags="list_dynamic",
+                )
+                canvas.create_text(
+                    x + piece_width / 2,
+                    center_y,
+                    text=value,
+                    fill=MUTED,
+                    font=self._canvas_font(17),
+                    tags="list_dynamic",
+                )
             elif kind == "vs":
                 canvas.create_text(
                     x + piece_width / 2,
@@ -5777,7 +6008,14 @@ class Panel(ctk.CTk):
         )
         center_y = (top + bottom) / 2 + 1
         include_result = surface is not getattr(self, "matches", None)
-        columns = _result_column_bounds(width, include_result=include_result)
+        # The custom-games surface differs twice over: the official API never names
+        # a custom game's map, so that column goes, and MODE is always the literal
+        # "custom", so the slot is spent on the lobby size instead.
+        is_custom = surface is getattr(self, "custom_list", None)
+        include_map = not is_custom
+        columns = _result_column_bounds(
+            width, include_result=include_result, include_map=include_map
+        )
         # Head to Head intentionally leaves RESULT empty, but all shared
         # columns retain Profile Games' canonical positions.
         player_index = 5
@@ -5801,24 +6039,41 @@ class Panel(ctk.CTk):
             when,
             gap=7,
         )
+        lobby = summary.get("_lobby") or []
         self._canvas_icon_text(
             canvas,
             starts[1] + 6,
             center_y,
             "sword-cell.png",
             (32, 24),
-            str(summary.get("kind") or "?"),
+            (f"{len(lobby)} player" + ("s" if len(lobby) != 1 else ""))
+            if is_custom
+            else str(summary.get("kind") or "?"),
             gap=8,
         )
-        self._canvas_icon_text(
-            canvas,
-            starts[2] + 6,
-            center_y,
-            "map.png",
-            (28, 24),
-            self._canvas_ellipsis(summary.get("map"), 18),
-            gap=8,
-        )
+        if is_custom and len(lobby) > 1:
+            # Same hover contract as the matchup names: the shared tip, the shared
+            # hide-on-leave, and therefore the same poll and watchdog backstops.
+            # A single-player row has nothing to reveal, so it registers nothing.
+            lobby_bounds = (starts[1], center_y - 16, ends[1], center_y + 16)
+            surface.add_hitbox(
+                lobby_bounds,
+                key=("lobby", int(summary.get("game_id") or 0)),
+                on_enter=lambda target=surface, area=lobby_bounds, team=lobby: (
+                    self._show_canvas_roster_tip(target, area, team)
+                ),
+                on_leave=self._hide_roster_tip,
+            )
+        if include_map:
+            self._canvas_icon_text(
+                canvas,
+                starts[2] + 6,
+                center_y,
+                "map.png",
+                (28, 24),
+                self._canvas_ellipsis(summary.get("map"), 18),
+                gap=8,
+            )
         self._canvas_icon_text(
             canvas,
             starts[3] + 6,
@@ -6861,6 +7116,91 @@ class Panel(ctk.CTk):
             on_ready=lambda: self._set_profile_busy(False),
         )
 
+    def on_custom_search(self) -> None:
+        if self._cg_searching:
+            return
+        value = self.c_entry.get().strip()
+        if not self.c_status.winfo_manager():
+            self._show_profile_status()
+        self._set_custom_busy(True)
+        self.c_status.configure(text="Resolving…")
+        threading.Thread(target=self._custom_resolve, args=(value,), daemon=True).start()
+
+    def _custom_resolve(self, value: str) -> None:
+        try:
+            kind, resolved = self._resolve_value(value)
+        except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
+            msg = self._api_error_text(exc)
+            self.after(0, lambda: self._custom_failed(msg))
+            return
+        self.after(0, lambda: self._custom_after_resolve(kind, resolved))
+
+    def _custom_after_resolve(self, kind: str, resolved: object) -> None:
+        if kind == "id":
+            self._start_custom(resolved)
+            return
+        self._suggest(
+            resolved,
+            self.custom_list,
+            self.c_status,
+            self.c_entry,
+            after_pick=self._start_custom,
+            on_ready=lambda: self._set_custom_busy(False),
+        )
+
+    def _start_custom(self, pid: int) -> None:
+        self.c_entry.delete(0, "end")
+        self.c_entry.insert(0, str(pid))
+        self._cg_profile = pid
+        self._clear_surface_children(self.custom_list)
+        if not self.c_status.winfo_manager():
+            self._show_profile_status()
+        self._set_custom_busy(True)
+        self.c_status.configure(text="Loading…")
+        threading.Thread(target=self._custom_worker, args=(pid,), daemon=True).start()
+
+    def _custom_worker(self, pid: int) -> None:
+        try:
+            rows = customgames.custom_games(pid)
+        except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
+            msg = self._api_error_text(exc)
+            self.after(0, lambda: self._custom_failed(msg))
+            return
+        self.after(0, lambda: self._render_custom(pid, rows))
+
+    def _render_custom(self, pid: int, rows: list[dict]) -> None:
+        if self._cg_profile != pid:
+            return  # a newer search already took over
+        self._set_custom_busy(False)
+        self.c_refresh_btn.pack(side="right", padx=(10, 2), pady=1)
+        self._hide_roster_tip()  # the previous rows are about to be destroyed
+        for row in rows:
+            row["_canvas_key"] = ("game", int(row.get("game_id") or 0))
+        self.custom_list.set_items(rows, renderer=self._draw_game_row, row_height=64)
+        self._set_scrollbar_visible(self.custom_list, len(rows) > 5)
+        if not rows:
+            self.c_status.configure(text="No custom games")
+        elif len(rows) >= customgames.MAX_MATCHES:
+            # Say why the list stops here, so a player with a long custom history
+            # doesn't read the ceiling as a bug in the launcher.
+            self.c_status.configure(text=f"{len(rows)} custom games (all the game exposes)")
+        else:
+            self.c_status.configure(text=f"{len(rows)} custom games")
+
+    def _custom_failed(self, message: str) -> None:
+        self._set_custom_busy(False)
+        self.c_status.configure(text="")
+        self._error("Custom games", message)
+
+    def _set_custom_busy(self, busy: bool) -> None:
+        """Disable the Custom tab's Search button while a request is running."""
+        self._cg_searching = busy
+        self.c_search_btn.configure(state="disabled" if busy else "normal")
+
+    def _refresh_custom(self) -> None:
+        if self._cg_profile is not None:
+            self._start_custom(self._cg_profile)
+
     def _start_profile(self, pid: int) -> None:
         self.p_entry.delete(0, "end")
         self.p_entry.insert(0, str(pid))
@@ -7535,6 +7875,28 @@ class Panel(ctk.CTk):
                 "Game running", "Age of Empires IV is already running. Close it first."
             )
             return
+        # A replay whose mod content isn't installed cannot be played at all, so say
+        # so before the install/Steam/sign-in steps rather than after them.
+        # service.watch_replay refuses it too — that is the authoritative gate and
+        # the one the CLI goes through; this exists so a refusal reads as a refusal
+        # instead of arriving as a red "Playback failed" modal.
+        absent: list[replaymods.ModRequirement] = []
+        with contextlib.suppress(Exception):
+            absent = replaymods.missing_for(self.cfg, path)
+        if absent:
+            # Name them from what is already known locally — free, so the dialog
+            # can open at once. Only a guid nobody has seen is worth a request,
+            # and that one goes off the UI thread.
+            names: dict[str, modnames.ModName] = {}
+            with contextlib.suppress(Exception):
+                names = modnames.lookup(
+                    self.cfg, [req.guid for req in absent], [], allow_network=False
+                )
+            if modnames.all_named(absent, names):
+                self._report_missing_mods(absent, names)
+            else:
+                self._resolve_missing_mod_names(path, absent, names)
+            return
         # Make sure we know where the game is installed (auto-detect, else ask).
         if not self._ensure_game_install():
             return
@@ -7568,6 +7930,70 @@ class Panel(ctk.CTk):
             self._setup_wrapper_then_play(path)
             return
         self._continue_play(path)
+
+    def _report_missing_mods(
+        self, absent: list, names: dict[str, modnames.ModName]
+    ) -> None:
+        """Refuse the playback, naming the mods wherever a title is known."""
+
+        # Exactly one page becomes a button to open it; the address itself then
+        # stays out of the text, where it would only be something to retype.
+        # Several pages keep their addresses listed, since one click cannot
+        # sensibly stand for all of them.
+        pages = modnames.page_urls(absent, names)
+        single_page = pages[0] if len(pages) == 1 else None
+        body = (
+            "This replay was recorded with mod content that is not installed:\n\n"
+            + modnames.describe_block(absent, names, show_urls=single_page is None)
+            + f"\n\n{modnames.subscribe_hint(absent, names)}"
+            + f"\n\nMods are read from: {self.cfg.mods_dir}"
+        )
+        if single_page is None:
+            self._info("Mod required", body)
+            return
+        if self._modal(
+            "Mod required",
+            body,
+            buttons=[("Close", False), ("Open mod page", True)],
+        ):
+            with contextlib.suppress(Exception):
+                webbrowser.open(single_page)
+
+    def _resolve_missing_mod_names(
+        self, path: Path, absent: list, names: dict[str, modnames.ModName]
+    ) -> None:
+        """Ask the match API for the titles nothing local knew, then report.
+
+        The refusal itself is already settled — this waits only for a label, so
+        the replay controls lock for the moment it takes and the requests run on
+        a worker. The UI thread never makes a network call, and a lookup that
+        fails or times out simply reports the identifiers.
+        """
+
+        self._set_playing(True)
+        self.status.configure(text="Identifying the missing mod…")
+
+        def worker() -> None:
+            found = dict(names)
+            with contextlib.suppress(Exception):
+                found.update(
+                    modnames.lookup(
+                        self.cfg,
+                        [req.guid for req in absent],
+                        replaymods.player_steam_ids(path),
+                        match_id=aoe4world.game_id_from_name(Path(path).name),
+                    )
+                )
+            self.after(0, lambda: self._missing_mod_names_ready(absent, found))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _missing_mod_names_ready(
+        self, absent: list, names: dict[str, modnames.ModName]
+    ) -> None:
+        self._set_playing(False)
+        self.status.configure(text="")
+        self._report_missing_mods(absent, names)
 
     def _continue_play(self, path: Path) -> None:
         # Connect a Steam account only when it's actually needed: an old build has

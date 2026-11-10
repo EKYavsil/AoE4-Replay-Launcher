@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import filecmp
 import json
 import os
 import shutil
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import tools
+from . import replaymods, tools
 from .config import Config
 
 # The game executable only. EssenceEditor.exe (the content editor) is deliberately
@@ -929,6 +930,13 @@ def heal_wrapper_paths(cfg: Config) -> None:
 
 # --- temporary user-mods handling (unchanged from the direct-launch design) ----
 
+_DISABLED_MODS_DIR = ".aoe4-disabled-mods"
+_BACKUP_PREFIX = "mods_"
+# Suffix of the folder kept when the game's recreated mods tree can't be merged
+# back. Named here because the startup sweep has to find these again.
+_CONFLICT_SUFFIX = ".replay-conflict-"
+
+
 @dataclass
 class ModsState:
     original: Path
@@ -939,7 +947,7 @@ def _disabled_mods_root(cfg: Config) -> Path:
     # A sibling of the mods folder so disabling is an atomic same-volume rename;
     # Documents may sit on a different drive than the project (a move there would
     # be a slow, interruptible copy+delete).
-    return cfg.mods_dir.parent / ".aoe4-disabled-mods"
+    return cfg.mods_dir.parent / _DISABLED_MODS_DIR
 
 
 def disable_user_mods(cfg: Config) -> ModsState | None:
@@ -950,10 +958,41 @@ def disable_user_mods(cfg: Config) -> ModsState | None:
     # Unique suffix so two disables in the same second never nest one backup
     # inside the other (shutil.move into an existing dir). The timestamp prefix
     # keeps recover()'s newest-first ordering correct.
-    disabled = root / f"mods_{datetime.now():%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}"
+    disabled = root / f"{_BACKUP_PREFIX}{datetime.now():%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}"
     print("Temporarily disabling AOE4 user mods for replay launch...")
     shutil.move(str(cfg.mods_dir), str(disabled))
     return ModsState(original=cfg.mods_dir, disabled=disabled)
+
+
+def _sweep_conflict_dirs(cfg: Config) -> None:
+    """Drop leftover ``mods.replay-conflict-*`` folders that hold nothing new.
+
+    Earlier versions parked the game's recreated mods folder next to the live one
+    whenever it held any file at all. Since the game re-downloads subscriptions
+    when it finds the folder missing, that left a full duplicate of the user's
+    mods behind on most launches, and nothing ever removed them. One is deleted
+    only when every mod archive in it is byte-for-byte identical to a live one at
+    the same relative path — a proven duplicate. A folder holding anything the
+    user does not already have is left exactly where it is.
+    """
+    parent = cfg.mods_dir.parent
+    if not parent.exists():
+        return
+    prefix = f"{cfg.mods_dir.name}{_CONFLICT_SUFFIX}"
+    for leftover in sorted(parent.glob(f"{prefix}*")):
+        if not leftover.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            unique = [
+                rel
+                for rel in _archives_relative_to(leftover)
+                if not _same_contents(leftover / rel, cfg.mods_dir / rel)
+            ]
+            if unique:
+                print(f"Keeping {leftover.name}: it holds {len(unique)} mod(s) you don't have.")
+                continue
+            shutil.rmtree(leftover, ignore_errors=True)
+            print(f"Removed leftover duplicate mods folder {leftover.name}.")
 
 
 def recover_user_mods(cfg: Config) -> None:
@@ -963,16 +1002,21 @@ def recover_user_mods(cfg: Config) -> None:
     mods folder is missing or only the game's empty skeleton, move the newest
     backup back. Real user files already in place are never overwritten.
     """
+    _sweep_conflict_dirs(cfg)
     root = _disabled_mods_root(cfg)
     if not root.exists():
         return
     backups = sorted(
-        (p for p in root.iterdir() if p.is_dir() and p.name.startswith("mods_")),
+        (p for p in root.iterdir() if p.is_dir() and p.name.startswith(_BACKUP_PREFIX)),
         reverse=True,
     )
     if not backups:
         return
-    if cfg.mods_dir.exists() and any(p.is_file() for p in cfg.mods_dir.rglob("*")):
+    # "Holds a file" used to stand in for "holds the user's mods", but the game
+    # recreates the folder with bookkeeping files in it, so a single stray file was
+    # enough to make this bail — leaving a crashed session's mods disabled forever.
+    # Ask whether a real mod archive is there instead.
+    if replaymods.mods_in(cfg.mods_dir):
         return  # the user's mods are in place; leave the backups for manual review
     newest = backups[0]
     with contextlib.suppress(OSError):
@@ -983,21 +1027,76 @@ def recover_user_mods(cfg: Config) -> None:
         print("Recovered user mods left disabled by a previous session.")
 
 
+def _archives_relative_to(root: Path) -> set[Path]:
+    return {p.relative_to(root) for p in root.rglob("*.sga") if p.is_file()}
+
+
+def _same_contents(left: Path, right: Path) -> bool:
+    """True only if both files exist and hold the same bytes.
+
+    Mod archives are named with a 64-hex id, but that id is *not* a hash of the
+    file's contents (verified), so a matching name is not proof of matching
+    bytes. Anything that leads to a delete compares the bytes themselves.
+    """
+    try:
+        if not right.is_file() or left.stat().st_size != right.stat().st_size:
+            return False
+        return filecmp.cmp(left, right, shallow=False)
+    except OSError:
+        return False
+
+
+def _merge_new_archives(recreated: Path, backup: Path) -> int:
+    """Copy mod archives found only in ``recreated`` into ``backup``; count them.
+
+    Only ``.sga`` files are carried over. Everything else the game leaves in a
+    recreated mods folder is its own bookkeeping (``mods_meta_data.lua`` and the
+    empty ``extension``/``replacement`` tree), which it rewrites on the next
+    launch — treating those as "the user installed something" is the very mistake
+    this replaces.
+
+    An archive already at the same relative path in the backup counts as present:
+    that is the same subscription and the same archive id, so the user's copy is
+    kept rather than overwritten by the one the game just fetched. Only a path the
+    backup has never seen is a mod that genuinely arrived while the replay ran.
+    """
+    known = _archives_relative_to(backup)
+    kept = 0
+    for src in sorted(recreated.rglob("*.sga")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(recreated)
+        if rel in known:
+            continue
+        dest = backup / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        kept += 1
+    return kept
+
+
 def restore_user_mods(state: ModsState | None) -> None:
     if state is None or not state.disabled.exists():
         return
     if state.original.exists():
-        # The game recreates an empty default mods skeleton (extension/, replacement/
-        # with no files) on every launch. Discard that; only preserve a recreated
-        # folder if it unexpectedly holds real files, so we never accumulate junk.
-        if any(p.is_file() for p in state.original.rglob("*")):
+        # The game recreates the mods folder as it runs, and finding it gone it
+        # re-downloads the subscriptions it knows about — so the recreated tree is
+        # normally just a duplicate of what we moved aside. Those duplicates are
+        # dropped. Anything genuinely new (a mod subscribed to while the replay
+        # played) is folded into the backup before it goes back, so it ends up live
+        # rather than orphaned in a folder beside it that nothing ever cleans up.
+        try:
+            kept = _merge_new_archives(state.original, state.disabled)
+            shutil.rmtree(state.original, ignore_errors=True)
+            if kept:
+                print(f"Kept {kept} mod archive(s) that appeared while the replay ran.")
+        except OSError as exc:
+            # Last resort: park it rather than delete something we couldn't merge.
             conflict = state.original.with_name(
-                f"{state.original.name}.replay-conflict-{datetime.now():%Y%m%d%H%M%S}"
+                f"{state.original.name}{_CONFLICT_SUFFIX}{datetime.now():%Y%m%d%H%M%S}"
             )
             shutil.move(str(state.original), str(conflict))
-            print(f"A mods folder with files appeared while the replay ran; kept it at: {conflict}")
-        else:
-            shutil.rmtree(state.original, ignore_errors=True)
+            print(f"Couldn't merge the recreated mods folder ({exc}); kept it at: {conflict}")
     shutil.move(str(state.disabled), str(state.original))
     print("AOE4 user mods restored.")
 

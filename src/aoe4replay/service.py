@@ -31,7 +31,9 @@ from . import (
     depot,
     launch,
     manifest,
+    modnames,
     replay,
+    replaymods,
     resticrepo,
 )
 from .config import Config
@@ -885,6 +887,48 @@ def watch_replay(
     # non-Gregorian) calendar must not block resolution — read it optionally.
     stamp = replay.read_timestamp_optional(replay_path)
 
+    # A replay recorded on a community map or game mode only plays with those mods
+    # present. Disabling user mods — the default, which keeps a vanilla replay from
+    # being altered by whatever the player has installed — would guarantee a broken
+    # playback, so leave them in place for a modded replay.
+    #
+    # A missing mod is refused outright rather than warned about. The game does not
+    # fail loudly: it silently substitutes its own defaults (a missing game mode
+    # falls back to StandardMode), the simulation then desyncs from the first frames
+    # and dumps the whole entity list per frame — measured at ~10 MB/s — while the
+    # viewer watches a match that never happened. There is no partial value in that
+    # playback to trade against, so there is no override. Refusing here also keeps
+    # the check ahead of build reconstruction, which downloads gigabytes.
+    needed_mods = replaymods.required_mods(replay_path)
+    keep_mods = bool(needed_mods)
+    if keep_mods:
+        absent = replaymods.missing_from(needed_mods, cfg)
+        if absent:
+            # Name the mods if anything can: the replay only identifies them by
+            # guid and an opaque pack number, which tells the user nothing about
+            # what to subscribe to. Strictly decoration — the refusal below is
+            # already decided, and a lookup that fails just leaves the
+            # identifiers in place.
+            names: dict[str, modnames.ModName] = {}
+            with contextlib.suppress(Exception):
+                names = modnames.lookup(
+                    cfg,
+                    [req.guid for req in absent],
+                    replaymods.player_steam_ids(replay_path),
+                    match_id=aoe4world.game_id_from_name(Path(replay_path).name),
+                )
+            raise RuntimeError(
+                "This replay was recorded with mod content that is not installed: "
+                + modnames.describe_inline(absent, names)
+                + ". "
+                # Shared with the panel's dialog, so the two can't drift apart in
+                # what they promise; "here" because the identifiers are inline.
+                + modnames.subscribe_hint(absent, names, anchor="here")
+                + " Playing without it would not reproduce the match."
+            )
+        listed = ", ".join(req.name for req in needed_mods)
+        print(f"Replay uses mod content: {listed}. Keeping your mods enabled.")
+
     # Fast path: a replay recorded on the build that is currently installed needs
     # no download or reconstruction — play it straight on the live install (no
     # RunAsDate either, since a current build has no expired date check).
@@ -897,7 +941,7 @@ def watch_replay(
         try:
             # Launch through Steam (not a direct spawn): a directly spawned game runs
             # without a full Steam session and crashes mid-match on long replays.
-            launch.launch_replay_via_steam(cfg, playback.name)
+            launch.launch_replay_via_steam(cfg, playback.name, keep_mods=keep_mods)
         finally:
             if playback.delete_after_launch and playback.path.is_file():
                 playback.path.unlink()
@@ -931,7 +975,9 @@ def watch_replay(
         return
 
     try:
-        launch.launch_replay(cfg, target_dir, playback.name, _runasdate_when(stamp, build))
+        launch.launch_replay(
+            cfg, target_dir, playback.name, _runasdate_when(stamp, build), keep_mods=keep_mods
+        )
     finally:
         # Keep the composed build — it's the cache, reused next time and cleaned by
         # buildcache. Only the temporary playback copy is dropped here.
