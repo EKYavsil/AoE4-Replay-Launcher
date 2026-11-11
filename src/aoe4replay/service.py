@@ -912,7 +912,6 @@ def watch_replay(
             names: dict[str, modnames.ModName] = {}
             with contextlib.suppress(Exception):
                 names = modnames.lookup(
-                    cfg,
                     [req.guid for req in absent],
                     replaymods.player_steam_ids(replay_path),
                     match_id=aoe4world.game_id_from_name(Path(replay_path).name),

@@ -220,11 +220,74 @@ def _registry_documents() -> Path | None:
         return None
 
 
+# Files the game itself writes, used to recognise its folder among candidates.
+# Deliberately not "mods": a player with no mods still has the others.
+_GAME_MARKERS = ("local.ini", "warnings.log", "playback", "mods")
+
+
+def _documents_candidates() -> list[Path]:
+    """Every Documents folder the game's data could plausibly sit in, best first.
+
+    The known-folder API is asked first because it is the answer Windows itself
+    gives, redirection included. The OneDrive roots are listed as well for the
+    case the API and the game disagree — see :func:`_default_documents`.
+    """
+    sources = (
+        _known_documents(),
+        _registry_documents(),
+        Path.home() / "Documents",
+        *(
+            Path(value) / "Documents"
+            for value in (
+                os.environ.get("ONEDRIVE"),
+                os.environ.get("ONEDRIVECONSUMER"),
+                os.environ.get("ONEDRIVECOMMERCIAL"),
+            )
+            if value
+        ),
+    )
+    found: list[Path] = []
+    for base in sources:
+        if base is None:
+            continue
+        base = Path(base)
+        if base not in found:
+            found.append(base)
+    return found
+
+
+def _game_folder_age(path: Path) -> float | None:
+    """How recently the game touched this folder, or None if it never did."""
+    stamps = []
+    for marker in _GAME_MARKERS:
+        with contextlib.suppress(OSError):
+            stamps.append((path / marker).stat().st_mtime)
+    return max(stamps) if stamps else None
+
+
 def _default_documents() -> Path:
-    """``<real Documents>/My Games/Age of Empires IV`` — where the game actually
-    stores its data, even when Documents is redirected to OneDrive."""
-    base = _known_documents() or _registry_documents() or (Path.home() / "Documents")
-    return base.joinpath(*_GAME_DOCS_SUBPATH)
+    """``<real Documents>/My Games/Age of Empires IV``, verified to be the one.
+
+    The known-folder API already honours OneDrive redirection, so normally its
+    answer is simply right. What it cannot tell us is whether the game agrees:
+    turning redirection on *after* the game has created its folder leaves the
+    data in the un-redirected path while the API reports the redirected one. Both
+    then exist, and reading the wrong one makes the launcher believe no mods are
+    installed — which now refuses every modded replay.
+
+    So the candidates are checked for files the game writes itself, and the most
+    recently touched wins: whichever folder the game is actually using is the one
+    being written to on every launch. With no candidate showing any sign of the
+    game — a fresh install — the API's answer stands, since that is where the
+    game will create it.
+    """
+    candidates = [base.joinpath(*_GAME_DOCS_SUBPATH) for base in _documents_candidates()]
+    live = [(age, path) for path in candidates if (age := _game_folder_age(path)) is not None]
+    if live:
+        return max(live, key=lambda pair: pair[0])[1]
+    if candidates:
+        return candidates[0]
+    return Path.home().joinpath("Documents", *_GAME_DOCS_SUBPATH)
 
 
 # The game and Steam may live on any drive / in any Steam library folder, so a

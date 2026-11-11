@@ -1,53 +1,110 @@
-"""Custom-lobby games for one profile, from the official match API.
+"""Custom-lobby games for one profile, from whichever source will answer.
 
-aoe4world indexes ranked and quick-match games only, so a custom lobby is
-invisible there — which is why this goes to the official endpoint instead.
+aoe4world indexes ranked and quick-match games only — a profile with 883 games
+there had none of its nine custom ones — so a custom lobby has to come from
+Relic. Two of their services expose it, and both are capped the same way: at most
+ten custom matches per profile, with ``page``, ``recordCount`` and
+``sortDirection`` ignored outright. Verified across six profiles, the two return
+*identical* sets, so the cap is the server's and not a property of either.
 
-Two hard server-side limits shape everything below, both measured rather than
-documented:
+**Relic's community match API is the primary source.** One request returns the
+whole page, and it carries things the official one does not:
 
-* **At most ten matches per profile.** ``page`` returns an empty list beyond the
-  first, and ``recordCount`` and ``sortDirection`` are ignored outright, so there
-  is no pagination and no way to reach further back than the server offers.
-* **The list carries only the queried player's own civilisation** and no opponent
-  at all (``profileId`` 0, ``userName`` null). Each match therefore has to be
-  detailed individually to learn who else was in the lobby, which is where the
-  real player list, civilisations and results come from.
+* the real map name, where the official API says only ``Generated_Map``;
+* the replay's download urls, so availability is a fact rather than a flag;
+* the rating change, the lobby name and the match's mod packs;
+* civilisations as ids, which the companion ``races`` table names — including
+  the newest ones the official API still reports as ``Unknown``.
 
-``mapType`` is always ``Generated_Map`` for a custom game: the API never names
-the map, so neither does the UI. Replay-only data (the real map, any mods) is not
-available until the replay itself is downloaded.
+**The official match API is kept as a fallback**, because the community one is
+undocumented: it is a method on a host the launcher already downloads replays
+from, and it could change shape without notice. Falling back costs one request
+per match instead of one per page, and loses the map name.
+
+Both are read-only and best-effort; a profile that cannot be answered yields an
+empty list rather than raising.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import UTC, datetime
 
-from . import aoe4world
+from . import nethttp
 
-_BASE = "https://api.ageofempires.com/api/GameStats/AgeIV/"
 _UA = "aoe4-replay-launcher"
-# matchType 0 selects custom games. The value is not documented; it was found by
-# probing, and 1/2 return the matchmaking histories instead.
-_MATCH_TYPE_CUSTOM = "0"
-# What the server will return no matter what is asked of it (verified: page 2+ is
-# empty, recordCount is ignored). Exposed so the UI can explain the ceiling.
-MAX_MATCHES = 10
 _TIMEOUT = 20.0
+
+# --- community (primary) ------------------------------------------------------
+_COMMUNITY = "https://aoe-api.worldsedgelink.com/community/leaderboard"
+_RECENT_HISTORY = _COMMUNITY + "/getRecentMatchHistory?title=age4&profile_ids=[{profile_id}]"
+_LEADERBOARDS = _COMMUNITY + "/getAvailableLeaderboards?title=age4"
+# matchtype 0 is "Custom" — named as such by getAvailableLeaderboards itself.
+_CUSTOM_MATCH_TYPE = 0
+
+# --- official (fallback) ------------------------------------------------------
+_OFFICIAL = "https://api.ageofempires.com/api/GameStats/AgeIV/"
+# The same matchtype, as a string, in the official API's own spelling.
+_OFFICIAL_CUSTOM = "0"
 # The API formats its timestamps US-style and in UTC, e.g. "7/14/2026 7:28:59 AM".
 _API_TIME = "%m/%d/%Y %I:%M:%S %p"
-# What a row shows where the API gave nothing: an absent opponent, or a civ it
-# reports as "Unknown" (a new or modded one). The same three letters the civ
-# abbreviations already use, so the row and the hover agree.
+
+# What either server will return no matter what is asked of it.
+MAX_MATCHES = 10
+# What a row shows where nothing could be resolved: an absent opponent, or a civ
+# reported as "Unknown". The same three letters the civ abbreviations use.
 UNKNOWN = "UNK"
 
+# The community API identifies civilisations by id and names them in its own
+# ``races`` table, whose ``name`` is an internal spelling. These are the twenty-
+# five it lists today, mapped onto the icon keys; a civ added later falls back to
+# its first three letters, which is already right for most of them.
+_RACE_ABBREV = {
+    "abbasid": "ABB",
+    "abbasid_ha_01": "AYY",
+    "byzantine": "BYZ",
+    "byzantine_ha_mac": "MAC",
+    "chinese": "CHI",
+    "chinese_ha_01": "ZXL",
+    "english": "ENG",
+    "french": "FRE",
+    "french_ha_01": "JDA",
+    "hre": "HRE",
+    "hre_ha_01": "OOD",
+    "japanese": "JPN",
+    "japanese_ha_sen": "SEN",
+    "jin_dynasty": "JIN",
+    "lancaster": "LAN",
+    "malian": "MAL",
+    "mongol": "MON",
+    "mongol_ha_gol": "GOL",
+    "ottoman": "OTT",
+    "rus": "RUS",
+    "scots": "SCO",
+    "sultanate": "DEL",
+    "sultanate_ha_tug": "TUG",
+    "templar": "TMP",
+    "vikings": "VIK",
+}
+_races_cache: dict[int, str] | None = None
 
-def _post(endpoint: str, payload: dict) -> dict:
+
+def _get_json(url: str) -> dict | None:
+    status, body = nethttp.get(url, timeout=_TIMEOUT, headers={"User-Agent": _UA})
+    if status != 200 or not body:
+        return None
+    with contextlib.suppress(ValueError):
+        parsed = json.loads(body)
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _post_json(endpoint: str, payload: dict) -> dict:
     request = urllib.request.Request(
-        _BASE + endpoint,
+        _OFFICIAL + endpoint,
         data=json.dumps(payload).encode(),
         method="POST",
         headers={
@@ -62,6 +119,41 @@ def _post(endpoint: str, payload: dict) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _civ_abbrev_for(race_id: object) -> str:
+    """The icon key for a community civilisation id, via the ``races`` table.
+
+    Fetched once per run and remembered: the table is static between patches, and
+    a tab opened repeatedly should not keep asking for it.
+    """
+    global _races_cache
+    if _races_cache is None:
+        table: dict[int, str] = {}
+        data = _get_json(_LEADERBOARDS) or {}
+        races = data.get("races")
+        races = races if isinstance(races, list) else []
+        for race in races:
+            if not isinstance(race, dict):
+                continue
+            name = str(race.get("name") or "").strip().lower()
+            try:
+                key = int(race.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if key and name:
+                table[key] = _RACE_ABBREV.get(name) or name[:3].upper()
+        # Only a table that actually arrived is remembered. Caching an empty one
+        # would turn a single failed request into civ icons missing for the rest
+        # of the run, with nothing to trigger a retry.
+        if table:
+            _races_cache = table
+        else:
+            return ""
+    try:
+        return _races_cache.get(int(race_id or 0), "")
+    except (TypeError, ValueError):
+        return ""
+
+
 def _parse_time(text: object) -> datetime | None:
     try:
         return datetime.strptime(str(text), _API_TIME)
@@ -69,14 +161,136 @@ def _parse_time(text: object) -> datetime | None:
         return None
 
 
+def _utc(stamp: object) -> datetime | None:
+    """A unix timestamp as the naive UTC datetime the row renderer expects."""
+    try:
+        return datetime.fromtimestamp(int(stamp), UTC).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _row(
+    *,
+    game_id: int,
+    mine: dict | None,
+    theirs: dict | None,
+    lobby: list[dict],
+    map_name: str,
+    duration: int,
+    started_at: datetime | None,
+    won: bool | None,
+    replay: bool,
+) -> dict:
+    """One row for the Custom tab, in the shape the shared renderer wants.
+
+    Both sources funnel through here, so a fallback row is indistinguishable from
+    a primary one except for the fields the official API cannot supply.
+    """
+    opponent_id = (theirs or {}).get("_pid") or 0
+    winner = None
+    if won is True:
+        winner = (mine or {}).get("_pid") or 0
+    elif won is False:
+        winner = opponent_id
+    return {
+        "game_id": game_id,
+        "name1": (mine or {}).get("name") or UNKNOWN,
+        "name2": (theirs or {}).get("name") or UNKNOWN,
+        "civ1": (mine or {}).get("civ") or UNKNOWN,
+        "civ2": (theirs or {}).get("civ") or UNKNOWN,
+        # No rosters: the shared renderer reads these only to offer its hover over
+        # the two names, which a custom row does not want. The lobby column has
+        # its own hover and reads _lobby instead.
+        "team1": [],
+        "team2": [],
+        "map": map_name,
+        "kind": "custom",
+        "duration": duration,
+        "started_at": started_at,
+        "winner": winner,
+        "_id1": (mine or {}).get("_pid") or 0,
+        "_id2": opponent_id,
+        "_all_ids": [p["_pid"] for p in lobby if p.get("_pid")],
+        "_lobby": lobby,
+        "_replay_available": replay,
+        # Draw "?"-style markers rather than a silent gap where a civ icon or an
+        # opponent is missing.
+        "_mark_unknown_civ": True,
+    }
+
+
+# --- primary: the community match API ----------------------------------------
+
+
+def _community_games(profile_id: int) -> list[dict] | None:
+    """This profile's custom games in one request, or None if unanswerable.
+
+    None and ``[]`` mean different things: None is "ask the other service", while
+    an empty list is this service saying the profile has no custom games.
+    """
+    from . import modnames  # local import: modnames owns the options blob
+
+    data = _get_json(_RECENT_HISTORY.format(profile_id=int(profile_id)))
+    if not data or "matchHistoryStats" not in data:
+        return None
+    aliases: dict[int, str] = {}
+    for profile in modnames._dicts(data.get("profiles")):
+        with contextlib.suppress(TypeError, ValueError):
+            aliases[int(profile.get("profile_id") or 0)] = str(profile.get("alias") or "")
+
+    rows: list[dict] = []
+    for match in modnames._dicts(data.get("matchHistoryStats")):
+        if match.get("matchtype_id") != _CUSTOM_MATCH_TYPE:
+            continue
+        options = modnames.decode_options(match.get("options")) or {}
+        members = modnames._dicts(match.get("matchhistorymember"))
+        lobby = []
+        for member in members:
+            with contextlib.suppress(TypeError, ValueError):
+                pid = int(member.get("profile_id") or 0)
+                lobby.append(
+                    {
+                        "_pid": pid,
+                        "name": aliases.get(pid) or str(pid),
+                        "civ": _civ_abbrev_for(member.get("civilization_id")),
+                        "_won": member.get("outcome") == 1,
+                    }
+                )
+        mine = next((p for p in lobby if p["_pid"] == int(profile_id)), None)
+        others = [p for p in lobby if p is not mine]
+        replay_ids = {u.get("profile_id") for u in modnames._dicts(match.get("matchurls"))}
+        started = _utc(match.get("startgametime"))
+        finished = _utc(match.get("completiontime"))
+        duration = int((finished - started).total_seconds()) if started and finished else 0
+        rows.append(
+            _row(
+                game_id=int(match.get("id") or 0),
+                mine=mine,
+                theirs=others[0] if others else None,
+                lobby=lobby,
+                # localizedMapName is the display spelling ("Lipany"); mapName is
+                # the id ("lipany"). Either beats the official API's silence.
+                map_name=str(options.get("localizedMapName") or options.get("mapName") or ""),
+                duration=duration,
+                started_at=started,
+                won=mine["_won"] if mine is not None else None,
+                replay=bool(replay_ids) if replay_ids else True,
+            )
+        )
+    return [row for row in rows if row["game_id"]]
+
+
+# --- fallback: the official match API ----------------------------------------
+
+
 def match_list(profile_id: int) -> list[dict]:
-    """The profile's custom matches, newest first, as the server returns them."""
-    data = _post(
+    """The profile's custom matches, newest first, as the official API returns them."""
+    data = _post_json(
         "GetMatchList",
         {
             "game": "age4",
             "gamertag": "unknown user",
-            "matchType": _MATCH_TYPE_CUSTOM,
+            "matchType": _OFFICIAL_CUSTOM,
             "page": 1,
             "playerNumber": 0,
             "profileId": int(profile_id),
@@ -91,13 +305,15 @@ def match_list(profile_id: int) -> list[dict]:
 
 
 def match_detail(profile_id: int, match_id: str) -> dict:
-    """One match's summary and full player list."""
-    return _post("GetMatchDetail", {"profileId": int(profile_id), "matchId": str(match_id)})
+    """One match's summary and full player list, from the official API."""
+    return _post_json("GetMatchDetail", {"profileId": int(profile_id), "matchId": str(match_id)})
 
 
-def _players(detail: dict) -> list[dict]:
-    """Every participant, normalised. ``userId`` holds the real profile id here;
-    the sibling ``profileId`` field is 0 for a custom game and must not be used."""
+def _official_players(detail: dict) -> list[dict]:
+    """Participants, normalised. ``userId`` holds the real profile id here; the
+    sibling ``profileId`` field is 0 for a custom game and must not be used."""
+    from . import aoe4world  # local import: aoe4world owns the civ-name table
+
     raw = detail.get("playerList")
     if not isinstance(raw, list):
         return []
@@ -109,123 +325,91 @@ def _players(detail: dict) -> list[dict]:
             pid = int(entry.get("userId") or 0)
         except (TypeError, ValueError):
             pid = 0
+        name = str(entry.get("civName") or "").strip().lower()
         players.append(
             {
                 "_pid": pid,
-                "name": str(entry.get("userName") or (pid or "?")),
-                "civ": aoe4world._civ_abbrev(_civ_key(entry.get("civName"))),
-                "replay": bool(entry.get("matchReplayAvailable")),
+                "name": str(entry.get("userName") or (pid or UNKNOWN)),
+                "civ": aoe4world._civ_abbrev(name.replace("'", "").replace(" ", "_")),
+                "_won": str(entry.get("winLoss") or "").lower() == "win",
+                "_replay": bool(entry.get("matchReplayAvailable")),
             }
         )
     return players
 
 
-def _civ_key(name: object) -> str:
-    """Map a display civ name onto the id spelling aoe4world's table uses.
+def _official_games(profile_id: int) -> list[dict]:
+    """The same page, at one request per match and without the map name."""
+    rows = []
+    for listed in match_list(profile_id)[:MAX_MATCHES]:
+        try:
+            detail = match_detail(profile_id, listed.get("matchId"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                # Being throttled is not a per-match hiccup to absorb: swallowing
+                # it would hand back ten rows of blanks that read as real data.
+                # Stop and let the caller say why — the same call aoe4world makes
+                # when a rate limit interrupts a multi-request walk.
+                raise
+            detail = {}
+        except (urllib.error.URLError, OSError, ValueError):
+            detail = {}
+        try:
+            game_id = int(listed.get("matchId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not game_id:
+            continue
+        lobby = _official_players(detail)
+        mine = next((p for p in lobby if p["_pid"] == int(profile_id)), None)
+        others = [p for p in lobby if p is not mine]
+        summary = detail.get("matchSummary")
+        summary = summary if isinstance(summary, dict) else {}
+        minutes = summary.get("matchLength") or listed.get("matchLength") or 0
+        try:
+            duration = int(float(minutes) * 60)
+        except (TypeError, ValueError):
+            duration = 0
+        # The list entry carries the queried player's own result even for a match
+        # against the AI, where the detail lists no opponent to infer one from.
+        own = str(listed.get("winLoss") or "").lower()
+        rows.append(
+            _row(
+                game_id=game_id,
+                mine=mine,
+                theirs=others[0] if others else None,
+                lobby=[{k: p[k] for k in ("_pid", "name", "civ")} for p in lobby],
+                map_name="",  # this API never names a custom game's map
+                duration=duration,
+                started_at=_parse_time(listed.get("dateTime"))
+                or _parse_time(summary.get("dateTime")),
+                won=True if own == "win" else False if own == "loss" else None,
+                replay=any(p["_replay"] for p in lobby) if lobby else True,
+            )
+        )
+    return rows
 
-    The official API says "Jeanne d'Arc" / "Zhu Xi's Legacy" where aoe4world says
-    ``jeanne_darc`` / ``zhu_xis_legacy``; dropping apostrophes and underscoring
-    spaces lines the two up, and civs missing from that table still fall back to
-    their first three letters, which is what the icon keys use.
-    """
-    text = str(name or "").strip().lower().replace("'", "").replace("’", "")
-    return text.replace(" ", "_")
 
-
-
-def _summary(profile_id: int, listed: dict, detail: dict) -> dict | None:
-    """One row for the Custom tab, in the same shape the shared renderer wants."""
-    try:
-        game_id = int(listed.get("matchId") or 0)
-    except (TypeError, ValueError):
-        return None
-    if not game_id:
-        return None
-
-    players = _players(detail)
-    mine = next((p for p in players if p["_pid"] == int(profile_id)), None)
-    others = [p for p in players if p is not mine]
-    # A match against the AI lists only the human players, so there may be no
-    # opponent to show at all; the row still carries everything else.
-    theirs = others[0] if others else None
-
-    # The queried player's own result comes from the *list* entry, which carries it
-    # even for a match against the AI — where the detail lists no opponent at all,
-    # so there is no second player to infer a loss from.
-    own_result = str(listed.get("winLoss") or "").lower()
-    opponent_id = (theirs or {}).get("_pid") or 0
-    winner = None
-    if own_result == "win":
-        winner = int(profile_id)
-    elif own_result == "loss":
-        winner = opponent_id
-
-    summary_block = detail.get("matchSummary")
-    summary_block = summary_block if isinstance(summary_block, dict) else {}
-    started = _parse_time(listed.get("dateTime")) or _parse_time(summary_block.get("dateTime"))
-    minutes = summary_block.get("matchLength") or listed.get("matchLength") or 0
-    try:
-        duration = int(float(minutes) * 60)
-    except (TypeError, ValueError):
-        duration = 0
-
-    fallback_civ = aoe4world._civ_abbrev(_civ_key(listed.get("civilization")))
-    return {
-        "game_id": game_id,
-        "name1": (mine or {}).get("name") or str(profile_id),
-        # UNKNOWN rather than an empty string: a custom match against the AI lists
-        # no opponent at all, and the row says so in the same words the civ slot
-        # and the hover use, instead of a bare "?".
-        "name2": (theirs or {}).get("name") or UNKNOWN,
-        "civ1": (mine or {}).get("civ") or fallback_civ or UNKNOWN,
-        "civ2": (theirs or {}).get("civ") or UNKNOWN,
-        # No rosters: the shared renderer reads these only to offer its hover over
-        # the two names, which a custom row does not want. Empty lists switch it off.
-        "team1": [],
-        "team2": [],
-        # The whole lobby, for the row's own player-count column and its hover.
-        # Separate from team1/team2 so it cannot re-enable the matchup hover.
-        # AI players are absent from the API's list, so this counts humans.
-        "_lobby": [
-            {"name": p["name"], "civ": p["civ"], "_pid": p["_pid"]} for p in players
-        ],
-        "map": "",  # the API never names a custom game's map
-        # Draw "?" where an unknown civilisation's icon would go, instead of a
-        # silent gap: for a custom game the opponent may be missing entirely, and
-        # a new or modded civ comes back as "Unknown".
-        "_mark_unknown_civ": True,
-        "kind": "custom",
-        "duration": duration,
-        "started_at": started,
-        "winner": winner,
-        "_id1": int(profile_id),
-        "_id2": opponent_id,
-        "_all_ids": [p["_pid"] for p in players if p["_pid"]],
-        "_replay_available": any(p["replay"] for p in players) if players else True,
-    }
+# --- what the panel calls -----------------------------------------------------
 
 
 def custom_games(profile_id: int) -> list[dict]:
     """Display-ready rows for this profile's custom games, newest first.
 
-    At most :data:`MAX_MATCHES` come back — that is the server's ceiling, not a
-    page size. One request lists the matches and one more details each of them;
-    a match whose detail cannot be fetched is still listed, from the list data
-    alone, rather than being dropped.
+    At most :data:`MAX_MATCHES` come back — the server's ceiling, not a page
+    size. The community API answers in one request and with more detail; the
+    official one is tried only when that cannot be read at all, since it needs a
+    request per match and cannot name the map.
 
-    The server's own order is arbitrary — it ignores ``sortColumn`` and
-    ``sortDirection``, and returns months out of sequence — so the rows are
-    sorted here, newest first. A row whose timestamp could not be parsed sorts
-    last rather than breaking the comparison.
+    Neither server's order is dependable — the official one returns months out of
+    sequence and ignores ``sortColumn`` — so the rows are sorted here. A row
+    whose timestamp could not be read sorts last rather than breaking the
+    comparison.
     """
-    rows = []
-    for listed in match_list(profile_id)[:MAX_MATCHES]:
-        try:
-            detail = match_detail(profile_id, listed.get("matchId"))
-        except (urllib.error.URLError, OSError, ValueError):
-            detail = {}
-        row = _summary(profile_id, listed, detail)
-        if row is not None:
-            rows.append(row)
+    rows: list[dict] | None = None
+    with contextlib.suppress(Exception):
+        rows = _community_games(profile_id)
+    if rows is None:
+        rows = _official_games(profile_id)
     rows.sort(key=lambda row: row["started_at"] or datetime.min, reverse=True)
     return rows

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -152,10 +153,6 @@ ASSET_DIR = Path(__file__).with_name("assets")
 # The four information columns retain their established proportions, PLAYERS
 # absorbs the remaining right-hand space, and ACTION keeps a safe minimum.
 RESULT_COLUMN_WEIGHTS = (16, 10, 12, 9)
-# Same four slots with MAP collapsed to nothing, so the surfaces that cannot
-# name a map keep every other column index — and every x coordinate the
-# shared row renderer depends on — exactly where they are.
-RESULT_COLUMN_WEIGHTS_NO_MAP = (16, 10, 0, 9)
 RESULT_COLUMN_WIDTH = 120.0
 RESULT_ACTION_FRACTION = 0.12
 RESULT_ACTION_MIN_WIDTH = 156.0
@@ -168,7 +165,6 @@ def _result_column_bounds(
     width: int,
     *,
     include_result: bool = True,
-    include_map: bool = True,
 ) -> tuple[tuple[float, float], ...]:
     """Return the canonical Profile Games column bounds for a canvas width.
 
@@ -193,11 +189,10 @@ def _result_column_bounds(
     result_left = result_center - result_half
     result_right = result_center + result_half
     table_width = max(0.0, result_left - left)
-    weights = RESULT_COLUMN_WEIGHTS if include_map else RESULT_COLUMN_WEIGHTS_NO_MAP
-    weight_total = float(sum(weights))
+    weight_total = float(sum(RESULT_COLUMN_WEIGHTS))
     bounds: list[tuple[float, float]] = []
     cursor = left
-    for weight in weights:
+    for weight in RESULT_COLUMN_WEIGHTS:
         next_cursor = cursor + table_width * weight / weight_total
         bounds.append((cursor, next_cursor))
         cursor = next_cursor
@@ -1133,11 +1128,6 @@ class Panel(ctk.CTk):
         # restore mods if a previous session was force-closed while a replay ran
         with contextlib.suppress(Exception):
             launch.recover_user_mods(self.cfg)
-        # Read the titles out of every mod archive on disk, so a later refusal can
-        # name what it is missing without asking the network. Costs nothing and
-        # covers mods that are no longer installed.
-        with contextlib.suppress(Exception):
-            modnames.harvest_local(self.cfg)
         # if the app was moved/updated, re-point the persistent Steam shim at the live exe
         with contextlib.suppress(Exception):
             launch.heal_wrapper_paths(self.cfg)
@@ -4047,12 +4037,20 @@ class Panel(ctk.CTk):
 
     # ---- themed modal dialogs (replace the native white messageboxes) -------
 
-    def _modal(self, title, message, *, buttons, danger=False, title_color=TEXT):
+    def _modal(
+        self, title, message, *, buttons, danger=False, title_color=TEXT,
+        links=None, tail=None,
+    ):
         """A panel-themed modal matching the sign-in / info dialogs.
 
         ``buttons`` is a list of ``(label, value)``; the last one is the primary
         action (accent, or red when ``danger``). Blocks until the user chooses
-        and returns that value (``None`` if the window is just closed)."""
+        and returns that value (``None`` if the window is just closed).
+
+        ``links`` is an optional list of ``(text, url)`` drawn under the message,
+        each on its own line and clickable when it has a url, for a dialog that
+        names things the reader may want to open. ``tail`` is a second block of
+        message text placed after them."""
         prev_grab = None
         with contextlib.suppress(Exception):
             prev_grab = self.grab_current()
@@ -4081,7 +4079,39 @@ class Panel(ctk.CTk):
         ctk.CTkLabel(
             shell, text=message, text_color=theme.TEXT_SOFT, font=self.font_normal,
             wraplength=440, justify="left",
-        ).pack(padx=28, pady=(8, 20), anchor="w")
+        ).pack(padx=28, pady=(8, 20) if not links else (8, 6), anchor="w")
+
+        if links:
+            # The named things themselves, each its own line, so a name is written
+            # once and is the link — not printed as text and again as an address.
+            # An entry without a url stays plain: it has nowhere to go.
+            link_box = ctk.CTkFrame(shell, fg_color="transparent")
+            link_box.pack(fill="x", padx=44, pady=(0, 6))
+            for text, url in links:
+                item = ctk.CTkLabel(
+                    link_box,
+                    text=text,
+                    text_color=GOLD_BRIGHT if url else theme.TEXT_SOFT,
+                    font=ctk.CTkFont(
+                        family=theme.FONT_BODY, size=16, underline=bool(url)
+                    ),
+                    cursor="hand2" if url else "",
+                    anchor="w",
+                    wraplength=424,
+                    justify="left",
+                )
+                item.pack(fill="x", anchor="w", pady=1)
+                if not url:
+                    continue
+                item.bind("<Button-1>", lambda _e, target=url: webbrowser.open(target))
+                item.bind("<Enter>", lambda _e, w=item: w.configure(text_color=GOLD))
+                item.bind("<Leave>", lambda _e, w=item: w.configure(text_color=GOLD_BRIGHT))
+
+        if tail:
+            ctk.CTkLabel(
+                shell, text=tail, text_color=theme.TEXT_SOFT, font=self.font_normal,
+                wraplength=440, justify="left",
+            ).pack(padx=28, pady=(6, 20), anchor="w")
 
         def _choose(value):
             result["value"] = value
@@ -4884,7 +4914,6 @@ class Panel(ctk.CTk):
         row: tk.Canvas,
         *,
         include_result: bool = True,
-        include_map: bool = True,
         lobby_column: bool = False,
     ) -> None:
         """Draw headings from the exact same bounds used by virtual rows."""
@@ -4905,18 +4934,15 @@ class Panel(ctk.CTk):
                     image=texture,
                     tags="header_dynamic",
                 )
-        bounds = _result_column_bounds(
-            width, include_result=include_result, include_map=include_map
-        )
+        bounds = _result_column_bounds(width, include_result=include_result)
         headings = [
             (0, "DATE (UTC)", 15),
             # "LOBBY", not "PLAYERS": column 5 already carries that heading, and
             # this one is the lobby's size rather than the matchup.
             (1, "LOBBY" if lobby_column else "MODE", 14),
+            (2, "MAP", 14),
             (3, "DURATION", 14),
         ]
-        if include_map:
-            headings.insert(2, (2, "MAP", 14))
         if include_result:
             headings.append((4, "RESULT", 14))
         headings.extend(((5, "PLAYERS", 14), (6, "ACTION", 14)))
@@ -4940,7 +4966,6 @@ class Panel(ctk.CTk):
         parent: ctk.CTkFrame,
         *,
         include_result: bool = True,
-        include_map: bool = True,
         lobby_column: bool = False,
     ) -> tk.Canvas:
         row = tk.Canvas(
@@ -4956,13 +4981,9 @@ class Panel(ctk.CTk):
         row.pack(fill="x", padx=14, pady=(3, 0))
         row.bind(
             "<Configure>",
-            lambda _event, canvas=row, result=include_result, mapped=include_map,
-            lobby=lobby_column: (
+            lambda _event, canvas=row, result=include_result, lobby=lobby_column: (
                 self._draw_column_header(
-                    canvas,
-                    include_result=result,
-                    include_map=mapped,
-                    lobby_column=lobby,
+                    canvas, include_result=result, lobby_column=lobby
                 )
             ),
         )
@@ -5022,9 +5043,7 @@ class Panel(ctk.CTk):
             justify="center",
             wraplength=218,
         )
-        self.c_column_header = self._column_header(
-            games_shell, include_map=False, lobby_column=True
-        )
+        self.c_column_header = self._column_header(games_shell, lobby_column=True)
         self.custom_list = VirtualListCanvas(
             games_shell,
             self,
@@ -6008,14 +6027,10 @@ class Panel(ctk.CTk):
         )
         center_y = (top + bottom) / 2 + 1
         include_result = surface is not getattr(self, "matches", None)
-        # The custom-games surface differs twice over: the official API never names
-        # a custom game's map, so that column goes, and MODE is always the literal
-        # "custom", so the slot is spent on the lobby size instead.
+        # On the custom-games surface MODE is always the literal "custom", so the
+        # slot is spent on the lobby size instead.
         is_custom = surface is getattr(self, "custom_list", None)
-        include_map = not is_custom
-        columns = _result_column_bounds(
-            width, include_result=include_result, include_map=include_map
-        )
+        columns = _result_column_bounds(width, include_result=include_result)
         # Head to Head intentionally leaves RESULT empty, but all shared
         # columns retain Profile Games' canonical positions.
         player_index = 5
@@ -6064,16 +6079,15 @@ class Panel(ctk.CTk):
                 ),
                 on_leave=self._hide_roster_tip,
             )
-        if include_map:
-            self._canvas_icon_text(
-                canvas,
-                starts[2] + 6,
-                center_y,
-                "map.png",
-                (28, 24),
-                self._canvas_ellipsis(summary.get("map"), 18),
-                gap=8,
-            )
+        self._canvas_icon_text(
+            canvas,
+            starts[2] + 6,
+            center_y,
+            "map.png",
+            (28, 24),
+            self._canvas_ellipsis(summary.get("map"), 18),
+            gap=8,
+        )
         self._canvas_icon_text(
             canvas,
             starts[3] + 6,
@@ -6489,11 +6503,18 @@ class Panel(ctk.CTk):
         threading.Thread(target=self._suggest_worker, args=args, daemon=True).start()
 
     @staticmethod
-    def _api_error_text(exc: Exception) -> str:
+    def _api_error_text(exc: Exception, service: str = "aoe4world") -> str:
         # A failed request must read as a failure, not as "no results found".
         if isinstance(exc, aoe4world.Aoe4WorldError):
             return str(exc)
-        return "Something went wrong contacting aoe4world."
+        # Every source we read can throttle, and a rate limit is the one failure
+        # the user can actually act on, so it must survive the translation here
+        # rather than being flattened into "something went wrong". The shared
+        # wording names no host on purpose: it is the user's network being
+        # limited, not one server misbehaving.
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+            return aoe4world.RATE_LIMIT_MSG
+        return f"Something went wrong contacting {service}."
 
     def _h2h_failed(self, message: str) -> None:
         self._set_h2h_busy(False)
@@ -7163,7 +7184,9 @@ class Panel(ctk.CTk):
         try:
             rows = customgames.custom_games(pid)
         except Exception as exc:  # noqa: BLE001 - report instead of wedging the UI
-            msg = self._api_error_text(exc)
+            # Custom lobbies come from Relic, never from aoe4world; naming the
+            # wrong service sends the user to check the wrong thing.
+            msg = self._api_error_text(exc, "the game's match service")
             self.after(0, lambda: self._custom_failed(msg))
             return
         self.after(0, lambda: self._render_custom(pid, rows))
@@ -7890,7 +7913,7 @@ class Panel(ctk.CTk):
             names: dict[str, modnames.ModName] = {}
             with contextlib.suppress(Exception):
                 names = modnames.lookup(
-                    self.cfg, [req.guid for req in absent], [], allow_network=False
+                    [req.guid for req in absent], [], allow_network=False
                 )
             if modnames.all_named(absent, names):
                 self._report_missing_mods(absent, names)
@@ -7936,28 +7959,17 @@ class Panel(ctk.CTk):
     ) -> None:
         """Refuse the playback, naming the mods wherever a title is known."""
 
-        # Exactly one page becomes a button to open it; the address itself then
-        # stays out of the text, where it would only be something to retype.
-        # Several pages keep their addresses listed, since one click cannot
-        # sensibly stand for all of them.
-        pages = modnames.page_urls(absent, names)
-        single_page = pages[0] if len(pages) == 1 else None
-        body = (
-            "This replay was recorded with mod content that is not installed:\n\n"
-            + modnames.describe_block(absent, names, show_urls=single_page is None)
-            + f"\n\n{modnames.subscribe_hint(absent, names)}"
-            + f"\n\nMods are read from: {self.cfg.mods_dir}"
-        )
-        if single_page is None:
-            self._info("Mod required", body)
-            return
-        if self._modal(
+        # The names are listed once, as the links themselves, between the lead
+        # sentence and the rest — so nothing is written twice and the thing the
+        # reader wants to open is the thing they see. A name with no page stays
+        # on the same line, just not clickable.
+        self._modal(
             "Mod required",
-            body,
-            buttons=[("Close", False), ("Open mod page", True)],
-        ):
-            with contextlib.suppress(Exception):
-                webbrowser.open(single_page)
+            "This replay was recorded with mod content that is not installed:",
+            buttons=[("Close", True)],
+            links=modnames.describe_entries(absent, names),
+            tail=modnames.subscribe_hint(absent, names),
+        )
 
     def _resolve_missing_mod_names(
         self, path: Path, absent: list, names: dict[str, modnames.ModName]
@@ -7978,7 +7990,6 @@ class Panel(ctk.CTk):
             with contextlib.suppress(Exception):
                 found.update(
                     modnames.lookup(
-                        self.cfg,
                         [req.guid for req in absent],
                         replaymods.player_steam_ids(path),
                         match_id=aoe4world.game_id_from_name(Path(path).name),

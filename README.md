@@ -122,6 +122,7 @@ The panel can:
 
 - look up a player by name or profile ID and browse their games page by page;
 - filter games by date range;
+- list a player's recent custom-lobby games in their own tab;
 - list head-to-head matches between two players;
 - show each match's date, mode, map, civilizations, and winner;
 - download replays through the official Relic API;
@@ -129,10 +130,16 @@ The panel can:
 - play or delete downloaded replays;
 - manage saved historical builds and display their disk usage.
 
-> **Custom game replays** are intentionally not listed—the launcher finds ranked
-> and automatch games through the official Relic API, which does not index custom
-> games. If you obtain a custom game some other way, you can still import
-> it and the launcher will reconstruct its build and play it like any other replay.
+> **Custom game replays** have their own tab. Relic's match service returns at
+> most ten of them per player—a ceiling the server imposes, not a page size—so an
+> older custom game still has to be imported by hand, which works as it always did.
+
+> **Modded replays need their mod installed.** A replay recorded with mod content
+> does not play back correctly without it: the game quietly substitutes its own
+> rules, and the playback desynchronises from the match that was actually played.
+> The launcher therefore refuses to start such a replay, names the missing mod and
+> links to its page. Subscribe to it in the game's Mods browser—which works while
+> the game is running—and the replay plays normally.
 
 ## Getting started
 

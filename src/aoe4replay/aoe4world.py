@@ -48,7 +48,7 @@ _UA = "aoe4-replay-launcher"
 
 # Shown for any HTTP 429. Users read this as an app bug, so say plainly it isn't:
 # the server (not the launcher) is throttling their network for too many requests.
-_RATE_LIMIT_MSG = (
+RATE_LIMIT_MSG = (
     "This isn't a problem with the launcher — the server temporarily limited your "
     "network for making too many requests (HTTP 429). Please wait a few minutes and "
     "try again."
@@ -164,7 +164,7 @@ def _get_json(url: str, retries: int = 3, timeout: int = 15, strict: bool = Fals
             if status == 404:
                 return None  # not found is a real (empty) answer, not a failure
             if status == 429:
-                detail = _RATE_LIMIT_MSG
+                detail = RATE_LIMIT_MSG
             elif status >= 400:
                 detail = f"aoe4world returned an error (HTTP {status})"
             else:
@@ -553,7 +553,7 @@ def _download_via_worldsedge(match_id: int, dest: Path) -> bool:
             payload = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
-            raise _SourceUnavailable(_RATE_LIMIT_MSG) from exc
+            raise _SourceUnavailable(RATE_LIMIT_MSG) from exc
         raise _SourceUnavailable(f"replay list request failed (HTTP {exc.code})") from exc
     except Exception as exc:  # noqa: BLE001 - network/timeout -> let the caller fall back
         raise _SourceUnavailable("couldn't reach the replay list service") from exc
@@ -628,7 +628,7 @@ def _download_via_relic(match_id: int, profile_ids: list[int], dest: Path) -> bo
             if exc.code in (404, 410):  # this id genuinely has no replay
                 continue
             if exc.code == 429:  # rate limited -> stop, don't hammer the rest
-                raise _SourceUnavailable(_RATE_LIMIT_MSG) from exc
+                raise _SourceUnavailable(RATE_LIMIT_MSG) from exc
             error = exc  # 5xx etc. -> a real error, but a sibling id may still work
             continue
         except Exception as exc:  # noqa: BLE001 - network/timeout, treat as error
@@ -670,5 +670,5 @@ def download_replay(match_id: int, profile_ids: list[int], dest: Path) -> bool:
             # Every source is exhausted (both rate-limited, or offline). Prefer the
             # actionable rate-limit note if either source hit it.
             reasons = (str(primary_exc), str(fallback_exc))
-            message = _RATE_LIMIT_MSG if _RATE_LIMIT_MSG in reasons else str(fallback_exc)
+            message = RATE_LIMIT_MSG if RATE_LIMIT_MSG in reasons else str(fallback_exc)
             raise RuntimeError(message) from fallback_exc
