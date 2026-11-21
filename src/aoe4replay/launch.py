@@ -10,6 +10,7 @@ middleware licenses accept them.
 from __future__ import annotations
 
 import contextlib
+import csv
 import ctypes
 import filecmp
 import json
@@ -20,12 +21,13 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import replaymods, tools
+from . import gamelog, replaymods, tools
 from .config import Config
 
 # The game executable only. EssenceEditor.exe (the content editor) is deliberately
@@ -117,6 +119,102 @@ def _process_running(image: str) -> bool:
 def is_game_running() -> bool:
     """True if the AoE4 executable is currently running."""
     return _process_running(_GAME_IMAGE)
+
+
+def _game_pids() -> set[int]:
+    """Process ids of every running game executable (normally zero or one)."""
+    out = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {_GAME_IMAGE}", "/FO", "CSV", "/NH"],
+        check=False, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", creationflags=_NO_WINDOW,
+    ).stdout
+    pids: set[int] = set()
+    for row in csv.reader(out.splitlines()):
+        # "RelicCardinal.exe","3660","Console","1","3,224,528 K"; tasklist prints
+        # an INFO line instead when nothing matches, which this skips.
+        if len(row) >= 2 and row[0].lower() == _GAME_IMAGE.lower() and row[1].isdigit():
+            pids.add(int(row[1]))
+    return pids
+
+
+_WM_CLOSE = 0x0010
+_GW_OWNER = 4
+
+
+def request_game_close() -> bool:
+    """Ask the running game to close the way the user would: by closing its
+    window. Returns True if the request reached at least one game window.
+
+    ``WM_CLOSE`` is what the window's ✕ and the taskbar's "Close window" send;
+    the game answers it with its own orderly ``quit()`` (logged as
+    ``Requesting game quit with reason: Presentation``) and exits within seconds
+    — observed in every session on disk. Only top-level visible windows owned by
+    a ``RelicCardinal.exe`` process are addressed. Nothing is ever terminated:
+    if the game ignores the request, it stays open.
+    """
+    if os.name != "nt":
+        return False
+    pids = _game_pids()
+    if not pids:
+        return False
+    # A private handle on user32, not the shared ctypes.windll one: the
+    # prototypes declared below must neither leak into the panel's own calls
+    # nor be overwritten by them.
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    targets: list[int] = []
+
+    def collect(hwnd, _lparam):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if (
+            pid.value in pids
+            and user32.IsWindowVisible(hwnd)
+            and not user32.GetWindow(hwnd, _GW_OWNER)  # top-level, not a dialog
+        ):
+            targets.append(hwnd)
+        return True
+
+    user32.EnumWindows(enum_proc(collect), 0)
+    sent = sum(1 for hwnd in targets if user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0))
+    print(f"Asked the game to close ({sent} window(s) of process(es) {sorted(pids)}).")
+    return sent > 0
+
+
+def _start_replay_end_watcher(
+    cfg: Config,
+    replay_name: str,
+    on_replay_end: Callable[[], None] | None,
+    on_close_failed: Callable[[], None] | None,
+) -> gamelog.ReplayEndWatcher | None:
+    """Start watching the game's log for the end of this replay — called just
+    *before* the launch, so the log's previous contents are already behind it.
+
+    Best-effort: if it cannot start, the replay plays exactly as it always has
+    and the game is simply left open at the end.
+    """
+    try:
+        return gamelog.ReplayEndWatcher(
+            cfg.documents / gamelog.LOG_NAME,
+            replay_name,
+            close_game=request_game_close,
+            on_end=on_replay_end,
+            on_close_failed=on_close_failed,
+        ).start()
+    except Exception as exc:  # noqa: BLE001 - auto-close is a convenience, never required
+        print(f"Replay-end watcher not started ({exc}); the game will stay open at the end.")
+        return None
 
 
 def steam_app_running(app_id: str) -> bool:
@@ -290,15 +388,27 @@ def _wait_for_steam_running_state(
     return steam_app_running(app_id) == target
 
 
-def _wait_for_steam_game_session(cfg: Config, appear_timeout: int = _GAME_APPEAR_TIMEOUT) -> None:
+def _wait_for_steam_game_session(
+    cfg: Config,
+    appear_timeout: int = _GAME_APPEAR_TIMEOUT,
+    on_started: Callable[[], None] | None = None,
+) -> None:
     """Wait for AoE4 to start and then fully stop, entirely from Steam's registry
     ``Running`` flag — event-driven, so no ``tasklist`` polling and no fixed settle.
     The exit wait is unbounded (a replay can run a long time); Steam clears the flag
-    a moment after the game closes, which is exactly when a new launch is safe."""
+    a moment after the game closes, which is exactly when a new launch is safe.
+
+    ``on_started`` fires the moment Steam reports the game running, between the
+    two waits. Without it the caller cannot tell "still starting" from "playing"
+    — both are this one blocking call — and a "Starting the game" line would sit
+    on screen for the entire match."""
     if not _wait_for_steam_running_state(cfg.app_id, True, appear_timeout):
         print("AoE4 was not observed starting; not waiting.")
         return
     print("AOE4 is running. Waiting for it to exit...")
+    if on_started is not None:
+        with contextlib.suppress(Exception):  # a UI hook must not end the session wait
+            on_started()
     _wait_for_steam_running_state(cfg.app_id, False, None)
 
 
@@ -1101,7 +1211,14 @@ def restore_user_mods(state: ModsState | None) -> None:
     print("AOE4 user mods restored.")
 
 
-def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = False) -> None:
+def launch_replay_via_steam(
+    cfg: Config,
+    replay_name: str,
+    keep_mods: bool = False,
+    on_started: Callable[[], None] | None = None,
+    on_replay_end: Callable[[], None] | None = None,
+    on_close_failed: Callable[[], None] | None = None,
+) -> None:
     """Launch a current-build replay *through Steam* (``steam -applaunch``).
 
     The replay matches the installed build, so Steam launches the live install
@@ -1109,6 +1226,11 @@ def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = Fal
     session (which a direct spawn lacks, and which crashes mid-match on long
     replays). The persistent wrapper, if installed, sees no active request and
     passes this command straight through.
+
+    When the replay is over the game is asked to close (see :mod:`gamelog`):
+    this session was started for the replay, with the player's mods moved
+    aside until it exits, so it should not linger as an ordinary one.
+    ``on_replay_end`` / ``on_close_failed`` report that to the caller.
     """
     ensure_steam_running(cfg)
     mods_state = None if keep_mods else disable_user_mods(cfg)
@@ -1120,11 +1242,16 @@ def launch_replay_via_steam(cfg: Config, replay_name: str, keep_mods: bool = Fal
             str(cfg.steam_exe), "-applaunch", cfg.app_id,
             "-dev", "-replay", f"playback:{replay_name}",
         ]
-        print(f"Launching AOE4 through Steam: {' '.join(args)}")
-        subprocess.Popen(args)
-        # The game runs as a child of Steam, so track Steam's own app "running"
-        # flag (event-driven) rather than waiting on our forwarder Popen.
-        _wait_for_steam_game_session(cfg)
+        watcher = _start_replay_end_watcher(cfg, replay_name, on_replay_end, on_close_failed)
+        try:
+            print(f"Launching AOE4 through Steam: {' '.join(args)}")
+            subprocess.Popen(args)
+            # The game runs as a child of Steam, so track Steam's own app "running"
+            # flag (event-driven) rather than waiting on our forwarder Popen.
+            _wait_for_steam_game_session(cfg, on_started=on_started)
+        finally:
+            if watcher is not None:
+                watcher.stop()  # the game is gone (or never came): stop reading
     finally:
         restore_user_mods(mods_state)
 
@@ -1137,6 +1264,9 @@ def launch_replay(
     use_runasdate: bool = True,
     keep_mods: bool = False,
     dev: bool = True,
+    on_started: Callable[[], None] | None = None,
+    on_replay_end: Callable[[], None] | None = None,
+    on_close_failed: Callable[[], None] | None = None,
 ) -> None:
     """Launch a reconstructed build through Steam's official AoE4 app session.
 
@@ -1147,6 +1277,10 @@ def launch_replay(
     reconstructed exe (and, for old builds, the RunAsDate shim) and call
     ``steam -applaunch``; the wrapper Steam starts then runs that exe with a real
     Steam app session.
+
+    When the replay is over the game is asked to close (see :mod:`gamelog`): an
+    old build's main menu has nothing left to offer. ``on_replay_end`` /
+    ``on_close_failed`` report that to the caller.
     """
     launch_dir = Path(launch_dir)
     exe = find_executable(launch_dir)
@@ -1180,9 +1314,16 @@ def launch_replay(
             print("Steam replay wrapper is installed; future old replays will not restart Steam.")
 
         args = [str(cfg.steam_exe), "-applaunch", cfg.app_id]
-        print(f"Launching reconstructed AOE4 build through Steam: {' '.join(args)}")
-        subprocess.Popen(args, creationflags=_NO_WINDOW)
-        _wait_for_steam_game_session(cfg)
+        # Started after the Steam restart above and right before the launch, so
+        # everything the log held until now is behind the watcher's start.
+        watcher = _start_replay_end_watcher(cfg, replay_name, on_replay_end, on_close_failed)
+        try:
+            print(f"Launching reconstructed AOE4 build through Steam: {' '.join(args)}")
+            subprocess.Popen(args, creationflags=_NO_WINDOW)
+            _wait_for_steam_game_session(cfg, on_started=on_started)
+        finally:
+            if watcher is not None:
+                watcher.stop()  # the game is gone (or never came): stop reading
     finally:
         try:
             _clear_active_replay_request(cfg)

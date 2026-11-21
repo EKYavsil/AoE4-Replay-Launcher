@@ -100,6 +100,7 @@ from . import (  # noqa: E402
     launch,
     modnames,
     nethttp,
+    progress,
     replay,
     replaymods,
     service,
@@ -1059,6 +1060,7 @@ class Panel(ctk.CTk):
         self._searching = False
         self._playing = False
         self._game_running = False  # AoE4 open per the Steam registry -> lock actions
+        self._game_open_notice = False  # the red "close the game" line is on screen
         self._game_watcher = None  # event-driven watcher of the Steam "running" value
         self._downloading = False  # a replay download is running -> block a second
         self._cancel_event: threading.Event | None = None  # set while a download runs
@@ -1123,6 +1125,14 @@ class Panel(ctk.CTk):
         self._notification_texts = {"status": "", "notify": ""}
         self._active_notification_channel: str | None = None
         self._notice_canvas_items: dict[int, tuple[ctk.CTkFrame, tk.Canvas, int]] = {}
+        # The "still working" marker drawn beside the notification while a long
+        # operation runs (see _notice_spin_tick). One item per notice surface,
+        # created lazily next to that surface's text item.
+        self._notice_spin_items: dict[int, int] = {}
+        self._notice_spin_job: str | None = None
+        self._notice_spin_step = 0
+        self._notice_fill = MUTED
+        self._playing_name = ""
         self._cancel_visible = False
 
         # restore mods if a previous session was force-closed while a replay ran
@@ -3496,9 +3506,25 @@ class Panel(ctk.CTk):
             active.pack(fill="both", expand=True, padx=2, pady=3)
         self._render_toolbar_notice()
 
+    def _operation_notice_active(self) -> bool:
+        """True while a replay is being prepared or played.
+
+        That operation owns the shared notification line for its whole run. A
+        profile search or the MATCHES counter finishing meanwhile must not take
+        it over: clearing it wiped both the "Playing: …" status and the progress
+        line in one go, leaving a multi-gigabyte download with no sign of life.
+        """
+        return bool(getattr(self, "_playing", False))
+
     def _profile_status_changed(self, text: str) -> None:
         """A new count/loading state replaces any older inline notification."""
 
+        if text and self._operation_notice_active():
+            return  # the running replay keeps the line; see _operation_notice_active
+        if text and self._game_open_notice:
+            # Likewise the red "close the game" line: it is the only thing that
+            # says why Play does nothing, so a finished search must not erase it.
+            return
         if text:
             self._clear_inline_notifications()
             if getattr(self, "_active_tab", "Profile games") in _COUNTER_TABS:
@@ -3615,8 +3641,11 @@ class Panel(ctk.CTk):
     def _render_toolbar_notice(self) -> None:
         """Draw exactly one right-aligned string with no child background."""
 
-        for _, canvas, item in self._notice_canvas_items.values():
+        for key, (_, canvas, item) in self._notice_canvas_items.items():
             canvas.itemconfigure(item, text="")
+            spin = self._notice_spin_items.get(key)
+            if spin is not None:
+                canvas.itemconfigure(spin, text="")
         surface = self._notice_surface()
         if surface is None:
             return
@@ -3637,8 +3666,90 @@ class Panel(ctk.CTk):
         else:
             label = self.status
             text = ""
-        canvas.itemconfigure(item, text=text, fill=self._label_text_color(label))
+        self._notice_fill = self._label_text_color(label)
+        canvas.itemconfigure(item, text=text, fill=self._notice_fill)
         self._layout_notice_canvas_item(surface)
+        self._draw_notice_spin()
+
+    # ---- "still working" marker -----------------------------------------
+    #
+    # A long operation must never look frozen, and a percentage alone cannot
+    # promise that: plenty of phases have nothing honest to measure, and even a
+    # measured one can sit on the same whole number for a while on a slow disk.
+    # So while one runs, a small marker moves beside the line. It is drawn as its
+    # own canvas item, to the left of the text, rather than appended to it: the
+    # text is right-aligned, so changing its length would shift every character
+    # — the percentage included — back and forth on each frame.
+    #
+    # Each frame is one dot in three fixed slots, so the item's width never
+    # changes either and the marker itself stays put.
+
+    _NOTICE_SPIN_FRAMES = ("•  ", " • ", "  •", " • ")
+    _NOTICE_SPIN_MS = 240
+    _NOTICE_SPIN_GAP = 10  # px between the marker and the text it belongs to
+
+    def _start_notice_spin(self) -> None:
+        if self._notice_spin_job is None:
+            self._notice_spin_job = self.after(self._NOTICE_SPIN_MS, self._notice_spin_tick)
+        self._draw_notice_spin()
+
+    def _stop_notice_spin(self) -> None:
+        if self._notice_spin_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._notice_spin_job)
+            self._notice_spin_job = None
+        self._draw_notice_spin()
+
+    def _notice_spin_tick(self) -> None:
+        if not self._operation_notice_active():
+            self._notice_spin_job = None
+            self._draw_notice_spin()  # nothing is running any more: clear it
+            return
+        self._notice_spin_step = (self._notice_spin_step + 1) % len(self._NOTICE_SPIN_FRAMES)
+        # Reschedule before drawing: the drawer reads a pending job as "running".
+        self._notice_spin_job = self.after(self._NOTICE_SPIN_MS, self._notice_spin_tick)
+        self._draw_notice_spin()
+
+    def _draw_notice_spin(self) -> None:
+        """Place (or clear) the marker beside the current notice text."""
+        surface = self._notice_surface()
+        if surface is None:
+            return
+        cached = self._notice_canvas_items.get(id(surface))
+        if cached is None:
+            return
+        _, canvas, text_item = cached
+        spin = self._notice_spin_items.get(id(surface))
+        running = self._notice_spin_job is not None
+        bbox = canvas.bbox(text_item) if running else None
+        has_text = bool(bbox) and bool(str(canvas.itemcget(text_item, "text")))
+        if spin is None:
+            if not (running and has_text):
+                return
+            spin = canvas.create_text(
+                0,
+                0,
+                text="",
+                anchor="e",
+                fill=self._notice_fill,
+                font=(theme.FONT_BODY, 12),
+                tags="toolbar_notice_spin",
+            )
+            self._notice_spin_items[id(surface)] = spin
+        if not (running and has_text):
+            canvas.itemconfigure(spin, text="")
+            return
+        canvas.itemconfigure(
+            spin,
+            text=self._NOTICE_SPIN_FRAMES[self._notice_spin_step],
+            fill=self._notice_fill,
+        )
+        canvas.coords(
+            spin,
+            max(1, bbox[0] - self._NOTICE_SPIN_GAP),
+            max(1, canvas.winfo_height() // 2),
+        )
+        canvas.tag_raise(spin)
 
     def _place_cancel_button(self) -> None:
         y = 162 if getattr(self, "_active_tab", "Profile games") != "Saved builds" else 146
@@ -7837,6 +7948,9 @@ class Panel(ctk.CTk):
 
     def _apply_action_lock(self) -> None:
         """Repaint the Play/Delete controls to match the current lock state."""
+        # First, so the explanation follows the lock even before the replay
+        # list exists (the game may already be open when the launcher starts).
+        self._sync_game_open_notice()
         if not hasattr(self, "downloads"):
             return
         with contextlib.suppress(tk.TclError):
@@ -7847,6 +7961,27 @@ class Panel(ctk.CTk):
             self.dl_delete_all_btn.configure(
                 state="disabled" if self._replay_actions_locked() else "normal"
             )
+
+    _GAME_OPEN_NOTICE = "! Age of Empires IV is open — close it to play a replay"
+
+    def _sync_game_open_notice(self) -> None:
+        """Say, in red, why Play is locked while the game is open.
+
+        Only when the game runs *outside* a replay of ours — during our own
+        playback the line already reads "Playing: …" and Play is locked for that
+        reason instead. Removed when the game closes, but only if it is still
+        the line on screen: a newer message is never wiped on its behalf.
+        """
+        if not hasattr(self, "notify"):
+            return  # the toolbar is not built yet; the next lock change retries
+        show = self._game_running and not self._playing
+        if show == self._game_open_notice:
+            return
+        self._game_open_notice = show
+        if show:
+            self.notify.configure(text=self._GAME_OPEN_NOTICE, text_color=LOSS)
+        elif str(self.notify.cget("text")) == self._GAME_OPEN_NOTICE:
+            self.notify.configure(text="")
 
     def _set_playing(self, playing: bool) -> None:
         """Keep replay action hitboxes and their visual state in sync."""
@@ -8023,7 +8158,10 @@ class Panel(ctk.CTk):
         self._set_playing(True)  # block replay actions while Steam restarts
         for btn in self._play_buttons:
             btn.configure(state="disabled")
-        self.status.configure(text="Setting up Steam for replays…")
+        # A Steam restart takes tens of seconds with nothing to measure; the
+        # marker is what tells the user it is still going.
+        self.status.configure(text="Setting up Steam for replays")
+        self._start_notice_spin()
 
         def worker() -> None:
             err = None
@@ -8036,6 +8174,9 @@ class Panel(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _wrapper_setup_done(self, path: Path, err: str | None) -> None:
+        # Stop the marker now rather than on its next tick: _continue_play may
+        # open the sign-in dialog, and a dot must not keep moving behind it.
+        self._stop_notice_spin()
         self._set_playing(False)  # _continue_play / _start_play re-acquires it
         for btn in self._play_buttons:
             btn.configure(state="normal")
@@ -8098,19 +8239,24 @@ class Panel(ctk.CTk):
         self._cancel_event = threading.Event()
         for btn in self._play_buttons:
             btn.configure(state="disabled")
+        self._playing_name = path.name
         self.status.configure(text=f"Playing: {path.name}")
         warning = self.notify
-        # Fetching the manifest after sign-in can take a few minutes before any
-        # download percentage appears, so show a reassuring message in that gap;
-        # the first progress report below replaces it.
-        warning.configure(
-            text="Steam sign-in successful — preparing the replay…" if just_connected
-            else "Preparing the replay…",
-            text_color=GREEN,
+        # Show the first phase straight away, from the UI thread, so the line and
+        # its marker are moving before the worker has even started.
+        first = progress.PHASES["check"]
+        self._play_progress(
+            warning,
+            progress.Event(
+                first.key,
+                "Signed in to Steam — checking the replay" if just_connected else first.label,
+            ),
         )
 
-        def report(stage: str, pct: float | None) -> None:
-            self.after(0, lambda s=stage, p=pct: self._play_progress(warning, s, p))
+        def report(event: progress.Event | None) -> None:
+            # Worker thread: hand the event to Tk. Throttling already happened in
+            # progress.Reporter, so this cannot flood the event loop.
+            self.after(0, lambda e=event: self._play_progress(warning, e))
 
         def worker() -> None:
             error = None
@@ -8119,7 +8265,7 @@ class Panel(ctk.CTk):
             auth_failed = False
             try:
                 built = service.watch_replay(
-                    self.cfg, path, progress=report, cancel=self._cancel_event
+                    self.cfg, path, report=report, cancel=self._cancel_event
                 )
             except service.DownloadCancelled:
                 cancelled = True  # user cancelled — not a failure, no error modal
@@ -8152,32 +8298,40 @@ class Panel(ctk.CTk):
         if self._cancel_event is not None:
             self._cancel_event.set()
         self._cancel_button.configure(state="disabled")  # stays a tiny ✕, just greyed
-        self.status.configure(text="Cancelling download…")
+        # Not "download": the ✕ is offered from the first scan of the install,
+        # well before anything is fetched.
+        self.notify.configure(text="Cancelling", text_color=GREEN)
 
-    def _play_progress(self, warning: ctk.CTkLabel, stage: str, pct: float | None) -> None:
-        # the download (live-file copy + network fetch) is the only cancellable phase
-        self._show_cancel(stage in ("seed", "download"))
-        # green, shown where the deleted-replay warning lives; removed when done
-        if stage == "seed":
-            # disk copy of reusable game files, before any download starts
-            warning.configure(text="Preparing required files…", text_color=GREEN)
-            return
-        if stage == "rebuild":
-            warning.configure(
-                text="Saved build was out of date — rebuilding…", text_color=GREEN
-            )
-            return
-        if stage == "store":  # download done, now verifying + saving (not cancellable)
-            warning.configure(text="Saving downloaded files…", text_color=GREEN)
-            return
-        if pct is None:
+    def _play_progress(
+        self, warning: ctk.CTkLabel, event: progress.Event | None
+    ) -> None:
+        """Draw one progress event from the playback worker.
+
+        ``None`` means no phase is running any more — the game has started, or
+        the run is over — and the line goes back to the plain status.
+        """
+        if event is None:
+            self._stop_notice_spin()
+            self._show_cancel(False)
             warning.configure(text="")
+            if self._playing and self._playing_name:
+                # The game is up. Say what is playing instead of leaving the bar
+                # blank: it is also the only explanation for why Play is locked.
+                self.status.configure(text=f"Playing: {self._playing_name}")
             return
-        label = {
-            "download": "Downloading required files",
-            "build": "Building the launch build",
-        }.get(stage, "Working")
-        warning.configure(text=f"{label}… {pct:.0f}%", text_color=GREEN)
+        # A cancel already asked for keeps the ✕ greyed and its wording: the
+        # worker may still be finishing the phase it was in.
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            return
+        # The ✕ only where the worker really checks the cancel event.
+        self._show_cancel(event.cancellable)
+        # green while work runs; red when the line asks the user to do something
+        # (the same red as the "game is open" notice); removed when done
+        warning.configure(text=event.text(), text_color=LOSS if event.alert else GREEN)
+        if event.animated:
+            self._start_notice_spin()
+        else:
+            self._stop_notice_spin()  # an outcome, not work still going on
 
     @staticmethod
     def _fmt_size(num: float) -> str:
@@ -8498,6 +8652,10 @@ class Panel(ctk.CTk):
         if watchdog is not None:  # stop the session-long roster-tip backstop loop
             with contextlib.suppress(Exception):
                 self.after_cancel(watchdog)
+        if self._notice_spin_job is not None:  # and the progress marker's timer
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._notice_spin_job)
+            self._notice_spin_job = None
         if self._game_watcher is not None:  # wake the registry-watch thread so it exits
             with contextlib.suppress(Exception):
                 self._game_watcher.stop()
@@ -8524,13 +8682,15 @@ class Panel(ctk.CTk):
         path: Path | None = None,
     ) -> None:
         self._set_playing(False)
+        self._playing_name = ""
         self._cancel_event = None
+        self._stop_notice_spin()
         self._show_cancel(False)
         for btn in self._play_buttons:
             btn.configure(state="normal")
         warning.configure(text="")  # remove any download progress message
         if cancelled:
-            self.status.configure(text="Download cancelled.")
+            self.status.configure(text="Cancelled.")
             return
         if auth_failed:
             # The saved Steam login expired/was rejected. Clear it and open the

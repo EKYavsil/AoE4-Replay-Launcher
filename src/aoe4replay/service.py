@@ -32,6 +32,7 @@ from . import (
     launch,
     manifest,
     modnames,
+    progress,
     replay,
     replaymods,
     resticrepo,
@@ -392,13 +393,23 @@ ReuseMap = dict[str, list[tuple[str, manifest.ManifestRecord]]]
 
 
 def _plan_sources(
-    cfg: Config, records: list[manifest.ManifestRecord]
+    cfg: Config,
+    records: list[manifest.ManifestRecord],
+    rep: progress.Reporter | None = None,
+    cancel: threading.Event | None = None,
 ) -> tuple[ReuseMap, list[str], int]:
     """Decide where every manifest file comes from, trusting nothing by path.
 
     A file is taken from the live install only if its SHA-1 matches, otherwise
     from the content index if the exact (size, SHA-1) is stored, otherwise it is
     downloaded. Returns (reuse-by-snapshot, paths-to-download, seed-file-count).
+
+    On a cold cache this hashes most of a ~40 GB install, which is the first
+    long wait after pressing Play, so it reports its file count and honours
+    ``cancel``. The hash cache is saved whatever happens: it used to be written
+    only on success, so a cancel threw away every hash it had just computed and
+    the next attempt started from nothing — three attempts in a row could make
+    no progress at all.
     """
     hc = HashCache(_work_dir(cfg) / "seed-hash-cache.tsv")
     hc.load()
@@ -408,23 +419,34 @@ def _plan_sources(
     reuse: ReuseMap = {}
     to_download: list[str] = []
     from_seed = 0
-    for record in records:
-        if record.chunks == 0:
-            continue
-        seed_file = cfg.steam_install / record.path
-        if (
-            seed_file.is_file()
-            and seed_file.stat().st_size == record.size
-            and hc.sha1(seed_file) == record.sha1
-        ):
-            from_seed += 1
-            continue
-        loc = index.lookup(record.size, record.sha1)
-        if loc:
-            reuse.setdefault(loc.snapshot, []).append((loc.stored_path, record))
-        else:
-            to_download.append(record.path)
-    hc.save()
+    total = sum(1 for r in records if r.chunks != 0)
+    done = 0
+    try:
+        for record in records:
+            if record.chunks == 0:
+                continue
+            if cancel is not None and cancel.is_set():
+                raise DownloadCancelled("Cancelled.")
+            seed_file = cfg.steam_install / record.path
+            if (
+                seed_file.is_file()
+                and seed_file.stat().st_size == record.size
+                and hc.sha1(seed_file) == record.sha1
+            ):
+                from_seed += 1
+            else:
+                loc = index.lookup(record.size, record.sha1)
+                if loc:
+                    reuse.setdefault(loc.snapshot, []).append((loc.stored_path, record))
+                else:
+                    to_download.append(record.path)
+            done += 1
+            if rep is not None and total:
+                rep.update(
+                    done / total * 100.0, detail=progress.fmt_count(done, total)
+                )
+    finally:
+        hc.save()  # keep the hashes already computed, cancelled or not
     return reuse, to_download, from_seed
 
 
@@ -434,6 +456,7 @@ def _delta_seed(
     to_download: list[str],
     target_dir: Path,
     cancel: threading.Event | None = None,
+    rep: progress.Reporter | None = None,
 ) -> int:
     """Set ``target_dir`` up so DepotDownloader reuses the live game's chunks and
     downloads only the genuine delta. Best-effort: any problem returns 0 and a
@@ -449,14 +472,19 @@ def _delta_seed(
         depot_id = int(build.depots[0].id)
         live_manifest_id = int(live.depots[0].manifest)
         live_dir = _work_dir(cfg) / f"manifests_{live.path_id}"
-        depot.fetch_manifest(cfg, live, live_dir)  # ensure the live binary manifest exists
+        # ensure the live binary manifest exists (cancellable: this can retry for
+        # minutes, and the ✕ used to be dead for the whole of it)
+        depot.fetch_manifest(cfg, live, live_dir, cancel=cancel)
         live_binary = live_dir / ".DepotDownloader" / f"{depot_id}_{live_manifest_id}.manifest"
         if not live_binary.is_file():
             print("Chunk delta: live binary manifest not found; downloading full files.")
             return 0
+        if rep is not None:
+            rep.phase("seed")
         seeded = deltaseed.prepare_seed(
             cfg.steam_install, depot_id, live_manifest_id, live_binary, to_download,
             target_dir, cancel=cancel,
+            on_progress=rep.bytes_sink() if rep is not None else None,
         )
         print(
             f"Chunk delta: previous build {live.name} (manifest {live_manifest_id}); "
@@ -480,26 +508,67 @@ def _download_and_store(
     records: list[manifest.ManifestRecord],
     to_download: list[str],
     target_dir: Path,
-    report: Callable[[str, float | None], None] | None = None,
+    rep: progress.Reporter | None = None,
     cancel: threading.Event | None = None,
 ) -> None:
-    """Download files into ``target_dir`` and persist+index them in restic."""
-    # Seeding copies the live files on disk first (no network yet), so report a
-    # distinct "seed" phase — showing "downloading 0%" during a disk copy is wrong.
-    if report:
-        report("seed", None)
-    _delta_seed(cfg, build, to_download, target_dir, cancel=cancel)
-    dl_progress = (lambda p: report("download", p)) if report else None
-    depot.download_files(cfg, build, target_dir, to_download, progress=dl_progress, cancel=cancel)
+    """Download files into ``target_dir`` and persist+index them in restic.
+
+    Each stretch reports as its own phase, because each has a different reason
+    to be slow and the user deserves to know which one they are waiting on:
+    fetching the live build's file list (network), copying reusable live files
+    (disk, measured in bytes), DepotDownloader working out which chunks it can
+    keep (no measure exists — the panel animates), the download itself (its own
+    percentage), then hashing and storing the result (both measured).
+    """
+    if rep is not None:
+        rep.phase("manifest")  # _delta_seed first fetches the live build's file list
+    _delta_seed(cfg, build, to_download, target_dir, cancel=cancel, rep=rep)
+
+    # Until DepotDownloader prints its first percentage it is validating the
+    # seeded files against the manifest — pure disk, no network, and it says
+    # nothing. Name that stretch instead of leaving the copy's line on screen.
+    if rep is not None:
+        rep.phase("prepare")
+    best = 0.0
+
+    def _on_download(pct: float) -> None:
+        # A retry restarts DepotDownloader and with it its own percentage. Hold
+        # the best figure seen rather than show the number falling: what was
+        # already downloaded is kept on disk and is skipped quickly on the way
+        # back up, so this only ever means "sitting still", never inventing.
+        nonlocal best
+        best = max(best, pct)
+        if rep.key != "download":
+            rep.phase("download", pct=best)
+        else:
+            rep.update(best)
+
+    def _on_retry(attempt: int, of: int) -> None:
+        rep.phase("retry", detail=f"attempt {attempt} of {of}")
+
+    depot.download_files(
+        cfg, build, target_dir, to_download,
+        progress=_on_download if rep is not None else None,
+        cancel=cancel,
+        on_retry=_on_retry if rep is not None else None,
+    )
     # The download is finished; verify + restic store can't be cancelled, so move
     # off the "download" phase (this hides the Cancel button — see _play_progress).
-    if report:
-        report("store", None)
     # Chunk reuse must never store a wrong byte: verify before restic sees anything.
-    deltaseed.verify_downloads(records, to_download, target_dir)
+    if rep is not None:
+        rep.phase("verify")
+    deltaseed.verify_downloads(
+        records, to_download, target_dir,
+        on_progress=rep.bytes_sink() if rep is not None else None,
+    )
     deltaseed.cleanup(target_dir)
     print(f"Storing {len(to_download)} downloaded file(s) in restic...")
-    resticrepo.backup_delta(cfg, build.build_id, target_dir)
+    if rep is not None:
+        rep.phase("store")
+    resticrepo.backup_delta(
+        cfg, build.build_id, target_dir,
+        progress=rep.pct_sink() if rep is not None else None,
+    )
     index = ContentIndex(_content_index_path(cfg))
     index.load()
     _index_stored(cfg, index, build.build_id, target_dir, {r.path: r for r in records}, to_download)
@@ -716,7 +785,7 @@ def _build_is_ready(
     build_id: str,
     target_dir: Path,
     records: list[manifest.ManifestRecord],
-    report: Callable[[str, float | None], None],
+    rep: progress.Reporter,
 ) -> bool:
     """True if the cached composed build at ``target_dir`` can be reused as-is.
 
@@ -729,11 +798,12 @@ def _build_is_ready(
     if build_id in _SESSION_BUILT:
         return True
     if buildcache.is_saved(cfg, build_id):
-        if buildcache.verify_sizes(records, target_dir):
+        rep.phase("saved")
+        if buildcache.verify_sizes(records, target_dir, progress=rep.count_sink()):
             _SESSION_BUILT.add(build_id)  # verified once this session -> trust further reuse
             return True
         print(f"Saved build {build_id} is out of date; rebuilding it.")
-        report("rebuild", None)
+        rep.phase("rebuild")
     return False
 
 
@@ -750,10 +820,13 @@ def _reconstruct_build(
     build: buildmap.Build,
     records: list[manifest.ManifestRecord],
     target_dir: Path,
-    report: Callable[[str, float | None], None],
+    rep: progress.Reporter,
     cancel: threading.Event | None = None,
 ) -> None:
     """Download/restore/compose the build into ``target_dir`` (wiping any old one)."""
+    # Leftovers from an earlier interrupted run can be many gigabytes; deleting
+    # them is real work the user would otherwise watch as a frozen line.
+    rep.phase("cleanup")
     _clean_stale_workdirs(cfg)
     work = _launch_work(cfg)
     run = uuid.uuid4().hex[:8]
@@ -762,7 +835,8 @@ def _reconstruct_build(
     # Decide where every manifest file comes from, trusting nothing by path: the
     # live install (SHA-1 verified), the content index, or a download.
     print("Planning the launch build (live install / store / download)...")
-    reuse_by_snap, to_download, from_seed = _plan_sources(cfg, records)
+    rep.phase("scan")
+    reuse_by_snap, to_download, from_seed = _plan_sources(cfg, records, rep, cancel)
     reused = sum(len(v) for v in reuse_by_snap.values())
     print(
         f"{from_seed} from live install, {reused} from the store, "
@@ -775,30 +849,30 @@ def _reconstruct_build(
         download_dir = _prepare_dir(work / f"download_{build.path_id}_{run}")
         try:
             _download_and_store(
-                cfg, build, records, to_download, download_dir, report=report, cancel=cancel
+                cfg, build, records, to_download, download_dir, rep=rep, cancel=cancel
             )
         except BaseException:
-            # On a cancel (or any download error) don't leave a partial download dir.
+            # On a cancel (or any download error) don't leave a partial download
+            # dir. Say so: deleting gigabytes is not instant, and the line would
+            # otherwise still read "Downloading 63%" while nothing downloads.
+            rep.phase("cleanup")
             _force_rmtree(download_dir)
             raise
         extra_dirs.append(download_dir)
 
-    # Restore + compose form the "build" phase shown in the panel.
-    report("build", 0.0)
     if reuse_by_snap:
         print(f"Restoring {reused} file(s) from the store (no download)...")
+        rep.phase("restore")
         reuse_dir = _prepare_dir(work / f"reuse_{build.path_id}_{run}")
         snaps = list(reuse_by_snap.items())
         total_snaps = len(snaps)
         for i, (snap, items) in enumerate(snaps):
             raw = _prepare_dir(work / f"reuseraw_{snap}_{run}")
-            # The restore is the slow part of the build phase; stream it as 0-85%
-            # so the panel isn't stuck at 0 until it suddenly jumps to 100.
+            # Several snapshots restore one after another; spread them over one
+            # 0-100% so the line climbs once instead of restarting per snapshot.
             restored = resticrepo.restore_paths(
                 cfg, snap, [sp for sp, _ in items], raw,
-                progress=lambda p, i=i, n=total_snaps: report(
-                    "build", (i + p / 100.0) / n * 85.0
-                ),
+                progress=lambda p, i=i, n=total_snaps: rep.update((i + p / 100.0) / n * 100.0),
             )
             for stored_path, record in items:
                 src = restored.get(stored_path) or (raw / stored_path.lstrip("/"))
@@ -826,19 +900,30 @@ def _reconstruct_build(
             _force_rmtree(raw)
         extra_dirs.append(reuse_dir)
 
+    rep.phase("compose")
     _prepare_dir(target_dir)  # wipe any stale/partial cached build, then compose fresh
     print("Composing launch build...")
-    base = 85.0 if reuse_by_snap else 0.0
     count = compose.compose_launch_build(
-        cfg, records, extra_dirs, target_dir,
-        progress=lambda p: report("build", base + p * (100.0 - base) / 100.0),
+        cfg, records, extra_dirs, target_dir, progress=rep.pct_sink()
     )
     print(f"Materialised {count} files into {target_dir}")
 
     # The download/restore sources are no longer needed; drop them (the composed
-    # build holds independent hard links).
+    # build holds independent hard links). This used to run after the line had
+    # already said 100%, which is exactly when a frozen-looking wait hurts most.
+    if extra_dirs:
+        rep.phase("cleanup")
     for extra in extra_dirs:
         _force_rmtree(extra)
+
+
+def _replay_end_reports(rep: progress.Reporter) -> dict[str, Callable[[], None]]:
+    """What the panel shows once the replay is over and the game is asked to
+    close — the same for the current build and a reconstructed one."""
+    return {
+        "on_replay_end": lambda: rep.phase("closing"),
+        "on_close_failed": lambda: rep.phase("close_failed"),
+    }
 
 
 def _runasdate_when(stamp: replay.ReplayStamp | None, build: buildmap.Build) -> datetime:
@@ -858,22 +943,21 @@ def watch_replay(
     cfg: Config,
     replay_path: Path,
     no_launch: bool = False,
-    progress: Callable[[str, float | None], None] | None = None,
+    report: Callable[[progress.Event | None], None] | None = None,
     cancel: threading.Event | None = None,
 ) -> str | None:
     """Full flow: reconstruct the matching build and play the replay.
 
-    ``progress`` (if given) reports the current phase and percent for the panel:
-    ``("download", 0-100)`` while files are fetched, ``("build", 0-100)`` while
-    the launch build is composed, and a ``None`` percent clears it.
+    ``report`` (if given) receives a :class:`progress.Event` each time the work
+    changes phase or measurably advances, and ``None`` once nothing is running
+    any more. Events are already throttled and monotonic; see
+    :mod:`aoe4replay.progress`.
 
     Returns the reconstructed build id that was launched (so the panel can offer
     to keep it), or ``None`` for the current-build fast path and ``--no-launch``.
     """
-
-    def _report(stage: str, pct: float | None) -> None:
-        if progress:
-            progress(stage, pct)
+    rep = progress.Reporter(report)
+    rep.phase("check")
     if not no_launch and launch.is_game_running():
         raise RuntimeError(
             "Age of Empires IV (RelicCardinal.exe) is already running. "
@@ -933,14 +1017,20 @@ def watch_replay(
     # RunAsDate either, since a current build has no expired date check).
     if _is_current_build(cfg, replay_path):
         print("Replay matches the installed build; playing it directly (no reconstruction).")
+        rep.phase("playback")
         playback = replay.copy_to_playback(replay_path, cfg.playback_dir)
         if no_launch:
             print(f"Playback replay: {playback.path}")
+            rep.clear()
             return
+        rep.phase("launch")
         try:
             # Launch through Steam (not a direct spawn): a directly spawned game runs
             # without a full Steam session and crashes mid-match on long replays.
-            launch.launch_replay_via_steam(cfg, playback.name, keep_mods=keep_mods)
+            launch.launch_replay_via_steam(
+                cfg, playback.name, keep_mods=keep_mods, on_started=rep.clear,
+                **_replay_end_reports(rep),
+            )
         finally:
             if playback.delete_after_launch and playback.path.is_file():
                 playback.path.unlink()
@@ -950,8 +1040,13 @@ def watch_replay(
     label = stamp.text if stamp else f"version {replay.read_version(replay_path)}"
     print(f"Replay {label} -> build {build.name} ({build.build_id})")
 
+    rep.phase("manifest")
     manifests_dir = _work_dir(cfg) / f"manifests_{build.path_id}"
-    manifest_path = depot.fetch_manifest(cfg, build, manifests_dir)
+    manifest_path = depot.fetch_manifest(
+        cfg, build, manifests_dir,
+        cancel=cancel,
+        on_retry=lambda attempt, of: rep.phase("retry", detail=f"attempt {attempt} of {of}"),
+    )
     records = manifest.parse_manifest(manifest_path)
     if not records:
         raise RuntimeError(f"No file records parsed from manifest: {manifest_path}")
@@ -959,23 +1054,27 @@ def watch_replay(
     # Reuse the composed build if it's cached this session or a verified saved one;
     # otherwise build it into the stable per-build cache directory.
     target_dir = buildcache.build_dir(cfg, build.build_id)
-    if _build_is_ready(cfg, build.build_id, target_dir, records, _report):
+    if _build_is_ready(cfg, build.build_id, target_dir, records, rep):
         print(f"Reusing cached build at {target_dir} (no rebuild).")
     else:
-        _reconstruct_build(cfg, build, records, target_dir, _report, cancel=cancel)
+        _reconstruct_build(cfg, build, records, target_dir, rep, cancel=cancel)
         _SESSION_BUILT.add(build.build_id)
-    _report("build", None)  # clear the build progress before the game launches
 
+    rep.phase("playback")
     playback = replay.copy_to_playback(replay_path, cfg.playback_dir, build.replay_version_override)
 
     if no_launch:
         print(f"--no-launch set. Build left at: {target_dir}")
         print(f"Playback replay: {playback.path}")
+        rep.clear()
         return
 
+    rep.phase("launch")
     try:
         launch.launch_replay(
-            cfg, target_dir, playback.name, _runasdate_when(stamp, build), keep_mods=keep_mods
+            cfg, target_dir, playback.name, _runasdate_when(stamp, build),
+            keep_mods=keep_mods, on_started=rep.clear,
+            **_replay_end_reports(rep),
         )
     finally:
         # Keep the composed build — it's the cache, reused next time and cleaned by

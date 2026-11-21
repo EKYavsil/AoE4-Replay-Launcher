@@ -21,6 +21,7 @@ import re
 import shutil
 import stat
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from . import launch
@@ -104,24 +105,37 @@ def unmark_saved(cfg: Config, build_id: str) -> None:
 
 # --- verification, sizing, cleanup ---------------------------------------------
 
-def verify_sizes(records: list[ManifestRecord], target_dir: Path) -> bool:
+def verify_sizes(
+    records: list[ManifestRecord],
+    target_dir: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> bool:
     """Cheap integrity check: every manifest file is present at the right size.
 
     No hashing — just ``stat`` — so it stays fast even on a slow disk. Catches the
     realistic ways a saved build goes bad (missing/truncated files, a game update
     that changed a file's size); a same-size content change is not caught, which
-    is rare enough to accept for the speed."""
-    for record in records:
-        if record.chunks == 0:
-            continue
-        if str(record.path).lower().endswith(".log"):
-            continue  # a runtime log (the game rewrites it on launch); its size drifts
+    is rare enough to accept for the speed.
+
+    ``progress(done, total)`` reports the file count as it goes: fifteen thousand
+    stats is quick on an SSD and distinctly not quick on a cold spinning disk,
+    and the user has just pressed Play and is watching."""
+    checked = [
+        r
+        for r in records
+        if r.chunks != 0 and not str(r.path).lower().endswith(".log")
+        # a runtime log (the game rewrites it on launch); its size drifts
+    ]
+    total = len(checked)
+    for done, record in enumerate(checked, start=1):
         path = target_dir / record.path
         try:
             if path.stat().st_size != record.size:
                 return False
         except OSError:
             return False
+        if progress is not None:
+            progress(done, total)
     return True
 
 

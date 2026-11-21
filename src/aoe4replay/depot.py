@@ -365,7 +365,14 @@ def _run_with_retry(
     args: list[str],
     progress: Callable[[float], None] | None = None,
     cancel: threading.Event | None = None,
+    on_retry: Callable[[int, int], None] | None = None,
 ) -> None:
+    """Run DepotDownloader, retrying transient Steam/CDN failures.
+
+    ``on_retry(attempt, of)`` is called when a retry is about to be waited out,
+    so the caller can say so on screen: the backoff is up to two minutes of
+    total silence otherwise, which is indistinguishable from a hang.
+    """
     exe = tools.ensure_depotdownloader(cfg)
     state_dir = str(_login_state_dir(cfg))  # reuse the remembered login written at sign-in
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -391,6 +398,9 @@ def _run_with_retry(
             )
         delay = min(120, 30 * attempt)
         print(f"DepotDownloader failed (likely transient Steam CDN); retrying in {delay}s...")
+        if on_retry is not None:
+            with contextlib.suppress(Exception):
+                on_retry(attempt + 1, _MAX_ATTEMPTS)
         # Cancellable backoff: a cancel during the wait aborts immediately.
         if cancel is not None:
             if cancel.wait(delay):
@@ -408,13 +418,23 @@ def _depot_args(cfg: Config, build: Build) -> list[str]:
     ]
 
 
-def fetch_manifest(cfg: Config, build: Build, manifest_dir: Path) -> Path:
+def fetch_manifest(
+    cfg: Config,
+    build: Build,
+    manifest_dir: Path,
+    cancel: threading.Event | None = None,
+    on_retry: Callable[[int, int], None] | None = None,
+) -> Path:
     """Download the manifest-only text for a build's primary depot.
 
     DepotDownloader names the file ``manifest_<depotId>_<manifestId>.txt``. We
     reuse a cached file only when it is *that exact* depot+manifest — a different
     manifest id is a different build (e.g. after a build-map correction or a
     misplaced cache file), and reusing it would reconstruct the wrong file set.
+
+    ``cancel`` matters more than it looks: fetching a manifest goes through the
+    same four attempts and up to two minutes of backoff as a download, and
+    without it the ✕ button did nothing at all for that whole stretch.
     """
     manifest_dir = Path(manifest_dir)
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -429,7 +449,7 @@ def fetch_manifest(cfg: Config, build: Build, manifest_dir: Path) -> Path:
         return cached
 
     args = [*_depot_args(cfg, build), "-manifest-only", "-dir", str(manifest_dir), *_auth_args(cfg)]
-    _run_with_retry(cfg, args)
+    _run_with_retry(cfg, args, cancel=cancel, on_retry=on_retry)
 
     written = next(iter(manifest_dir.rglob(expected)), None)
     if written is None:
@@ -447,11 +467,13 @@ def download_files(
     file_list: list[str],
     progress: Callable[[float], None] | None = None,
     cancel: threading.Event | None = None,
+    on_retry: Callable[[int, int], None] | None = None,
 ) -> None:
     """Download a specific list of files for a build into ``target_dir`` (with retry).
 
     ``progress`` is called with the latest download percentage (0-100) if given.
     A set ``cancel`` event kills the download and raises ``DownloadCancelled``.
+    ``on_retry(attempt, of)`` fires before a backoff wait.
     """
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -465,4 +487,4 @@ def download_files(
         "-filelist", str(filelist_path),
         *_auth_args(cfg),
     ]
-    _run_with_retry(cfg, args, progress, cancel)
+    _run_with_retry(cfg, args, progress, cancel, on_retry)

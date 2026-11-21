@@ -125,14 +125,25 @@ def has_build(cfg: Config, build_id: str) -> bool:
     return len(_snapshots_json(cfg, build_id)) > 0
 
 
-def backup_delta(cfg: Config, build_id: str, delta_dir: Path) -> None:
+def backup_delta(
+    cfg: Config,
+    build_id: str,
+    delta_dir: Path,
+    progress: Callable[[float], None] | None = None,
+) -> None:
+    """Store the downloaded delta as a snapshot. ``progress`` (if given) receives
+    restic's own percentage, so a multi-GB write is not a blank wait."""
     ensure_repo(cfg)
     # Never create an empty snapshot: it would later read as "build already stored"
     # (has_build) while containing no files, blocking a real ingest. Skip instead.
     if not any(p.is_file() for p in Path(delta_dir).rglob("*")):
         print(f"Nothing to store for {build_id} (empty delta); skipping restic backup.")
         return
-    _run(cfg, ["backup", "--tag", build_id, "--host", _HOST, str(delta_dir)])
+    args = ["backup", "--tag", build_id, "--host", _HOST, str(delta_dir)]
+    if progress is not None:
+        _run_json_streaming(cfg, [*args, "--json"], progress, check=True)
+    else:
+        _run(cfg, args)
 
 
 def list_builds(cfg: Config) -> list[Snapshot]:
@@ -246,11 +257,24 @@ def list_snapshot_files(cfg: Config, snapshot_id: str) -> list[tuple[str, int]]:
     return files
 
 
-def _run_restore_streaming(cfg: Config, args: list[str], progress: Callable[[float], None]) -> None:
-    """Run restic with ``--json`` and forward its restore ``percent_done`` (0-100).
+def _run_json_streaming(
+    cfg: Config,
+    args: list[str],
+    progress: Callable[[float], None],
+    *,
+    check: bool = False,
+) -> None:
+    """Run restic with ``--json`` and forward its ``percent_done`` (0-100).
 
-    Restoring a multi-GB build is the slow part of the build phase; streaming the
-    progress keeps the panel from sitting at 0% until it suddenly finishes.
+    Both ``restore`` and ``backup`` emit the same ``{"message_type":"status",
+    "percent_done":…}`` line, so one reader serves both: restoring a multi-GB
+    build and writing one into the repository are each minutes long, and without
+    this the panel sits still until they suddenly finish.
+
+    ``check`` is off for restore on purpose — restic returns non-zero for benign
+    metadata warnings there and the caller verifies the restored files by size
+    anyway — and on for backup, where a failure must not be mistaken for a
+    stored build.
     """
     exe = tools.ensure_restic(cfg)
     proc = subprocess.Popen(  # noqa: S603
@@ -275,6 +299,8 @@ def _run_restore_streaming(cfg: Config, args: list[str], progress: Callable[[flo
             ):
                 progress(float(msg["percent_done"]) * 100.0)
     proc.wait()
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, [str(exe), *args])
 
 
 def _snapshot_root(cfg: Config, snapshot_id: str) -> str | None:
@@ -328,7 +354,7 @@ def restore_paths(
             fh.write("\n".join(includes))
         args = ["restore", spec, "--target", str(target_dir), "--include-file", inc]
         if progress is not None:
-            _run_restore_streaming(cfg, [*args, "--json"], progress)
+            _run_json_streaming(cfg, [*args, "--json"], progress)
         else:
             _run(cfg, args, capture=True, check=False)
     finally:
